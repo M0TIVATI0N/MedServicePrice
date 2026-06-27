@@ -62,3 +62,17 @@ export interface PriceHistoryEntry {
 
     source_url: string;
 }
+
+export interface PriceSubscription {
+    subscription_id: string;
+    user_email: string;
+    clinic_id: string;
+    clinic_name: string;
+    service_id: string;
+    service_name: string;
+    target_price?: number;
+    current_price: number;
+    is_active: boolean;
+    created_at: Date;
+    last_notified_at?: Date;
+}

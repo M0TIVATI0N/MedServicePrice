@@ -5,11 +5,19 @@ import {
     fetchPriceHistory,
     fetchRawData,
     fetchUnmatchedQueue,
-    runParser
+    runParser,
+    createPriceSubscription,
+    getUserSubscriptions,
+    checkPriceChanges,
+    cancelSubscription,
+    compareClinics,
+    fetchClinicServicePriceHistory
 } from "./parser";
 
 import { serviceCatalog } from "./service-catalog";
 import { OfferRecord } from "./db";
+import { getParseErrorLog } from "./parsers/errorLogger";
+import { getDataCollector } from "./parsers/dataCollector";
 
 const router = Router();
 
@@ -187,6 +195,162 @@ router.get("/history", async (req: Request, res: Response) => {
     const history = await fetchPriceHistory(filters, 30);
 
     res.json(history);
+});
+
+/* -------------------- DETAILED PRICE HISTORY -------------------- */
+
+router.get(
+    "/history/:clinicId/:serviceId",
+    async (req: Request, res: Response) => {
+        const { clinicId, serviceId } = req.params;
+        const limit = Math.min(100, Number(req.query.limit) || 50);
+
+        try {
+            const history = await fetchClinicServicePriceHistory(
+                clinicId,
+                serviceId,
+                limit
+            );
+            res.json(history);
+        } catch (error: any) {
+            res.status(500).json({ error: error.message });
+        }
+    }
+);
+
+/* -------------------- CLINIC COMPARISON -------------------- */
+
+router.get("/compare/:serviceId", async (req: Request, res: Response) => {
+    const { serviceId } = req.params;
+    const clinicIds = req.query.clinics
+        ? String(req.query.clinics).split(",")
+        : undefined;
+
+    try {
+        const comparison = await compareClinics(serviceId, clinicIds);
+        res.json(comparison);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+/* -------------------- SUBSCRIPTIONS -------------------- */
+
+router.post("/subscriptions", async (req: Request, res: Response) => {
+    const { userEmail, clinicId, clinicName, serviceId, serviceName, targetPrice } =
+        req.body;
+
+    if (!userEmail || !clinicId || !serviceId) {
+        return res.status(400).json({
+            error: "Missing required fields: userEmail, clinicId, serviceId"
+        });
+    }
+
+    try {
+        const subscription = await createPriceSubscription(
+            userEmail,
+            clinicId,
+            clinicName || "",
+            serviceId,
+            serviceName || "",
+            targetPrice
+        );
+        res.json({ success: true, subscription });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+router.get("/subscriptions/:userEmail", async (req: Request, res: Response) => {
+    const { userEmail } = req.params;
+
+    try {
+        const subscriptions = await getUserSubscriptions(userEmail);
+        res.json(subscriptions);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+router.delete(
+    "/subscriptions/:subscriptionId",
+    async (req: Request, res: Response) => {
+        const { subscriptionId } = req.params;
+
+        try {
+            const cancelled = await cancelSubscription(subscriptionId);
+            res.json({ success: cancelled });
+        } catch (error: any) {
+            res.status(500).json({ error: error.message });
+        }
+    }
+);
+
+/* -------------------- CHECK PRICE CHANGES (CRON) -------------------- */
+
+router.post("/check-price-changes", async (_req: Request, res: Response) => {
+    try {
+        const result = await checkPriceChanges();
+        res.json(result);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+/* -------------------- PARSING ERRORS -------------------- */
+
+router.get("/parse-errors", async (req: Request, res: Response) => {
+    const limit = Math.min(500, Number(req.query.limit) || 100);
+    const source = String(req.query.source || "");
+
+    const errorLog = getParseErrorLog();
+
+    let logs;
+    if (source) {
+        logs = errorLog.getLogsBySource(source, limit);
+    } else {
+        logs = errorLog.getLogs(limit);
+    }
+
+    res.json(logs);
+});
+
+router.get("/parse-errors/stats", async (_req: Request, res: Response) => {
+    const errorLog = getParseErrorLog();
+    res.json(errorLog.getStatistics());
+});
+
+/* -------------------- MANUAL DOCUMENT PARSING -------------------- */
+
+router.post("/parse-document", async (req: Request, res: Response) => {
+    const { url, clinicId, clinicName, city, address, phone, workingHours } =
+        req.body;
+
+    if (!url || !clinicId) {
+        return res.status(400).json({
+            error: "Missing required fields: url, clinicId"
+        });
+    }
+
+    try {
+        const collector = getDataCollector();
+        const records = await collector.parseHtmlPage(url, {
+            clinicId,
+            clinicName: clinicName || "Unknown",
+            city: city || "",
+            address: address || "",
+            phone: phone || "",
+            workingHours: workingHours || ""
+        });
+
+        res.json({
+            success: true,
+            recordsCount: records.length,
+            records
+        });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
 });
 
 export default router;
