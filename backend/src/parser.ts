@@ -1,9 +1,10 @@
+import { SortOrder } from "mongoose";
 import crypto from "crypto";
 import { OfferRecord, ParseLog, PriceHistory, RawRecord } from "./db";
 import { fetchSourceRecords } from "./parsers";
 import { PARSER_REPLACE_DB, PARSER_STORE_RAW } from "./parsers/config";
 import { normalizeService } from "./normalizer";
-import { SortOrder } from "mongoose";
+import { sourceFromClinicId } from "./sources";
 import { ParseLogEntry, RawClinicRecord } from "./models";
 
 export const DATA_FRESHNESS_DAYS = 30;
@@ -81,15 +82,48 @@ export async function fetchNormalizedOffers(
     page = 1,
     limit = 50
 ) {
-    const query = activeOfferFilter(filters);
-    return OfferRecord.find(query)
-        .sort(sort)
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .lean();
+    const match = activeOfferFilter(filters);
+    const preSort: Record<string, 1 | -1> = {
+        price_kzt: 1,
+        parsed_at: -1,
+        _id: 1
+    };
+
+    const sortStage: Record<string, 1 | -1> = {};
+    for (const [key, dir] of Object.entries(sort)) {
+        sortStage[key] = dir === -1 || dir === "desc" ? -1 : 1;
+    }
+    if (!sortStage._id) sortStage._id = 1;
+
+    const pipeline: any[] = [
+        { $match: match },
+        { $sort: preSort },
+        {
+            $group: {
+                _id: { clinic_id: "$clinic_id", service_id: "$service_id" },
+                doc: { $first: "$$ROOT" }
+            }
+        },
+        { $replaceRoot: { newRoot: "$doc" } },
+        { $sort: sortStage },
+        { $skip: (page - 1) * limit },
+        { $limit: limit }
+    ];
+
+    return OfferRecord.aggregate(pipeline).exec();
 }
 
-export async function fetchClinics(query: Record<string, any> = {}, limit = 500) {
+export async function countDistinctOffers(filters: Record<string, any> = {}) {
+    const result = await OfferRecord.aggregate([
+        { $match: activeOfferFilter(filters) },
+        { $group: { _id: { clinic_id: "$clinic_id", service_id: "$service_id" } } },
+        { $count: "total" }
+    ]).exec();
+
+    return result[0]?.total ?? 0;
+}
+
+export async function fetchClinics(query: Record<string, any> = {}, limit = 2000) {
     return OfferRecord.aggregate([
         { $match: activeOfferFilter(query) },
         {
@@ -245,6 +279,7 @@ export async function runParser(): Promise<RunParserResult> {
         const offer = normalizeService(raw);
         offer.parsed_at = parsedAt;
         offer.is_active = true;
+        const sourceTag = sourceFromClinicId(offer.clinic_id);
 
         if (offer.service_id.startsWith("unmatched-")) {
             unmatched++;
@@ -297,7 +332,8 @@ export async function runParser(): Promise<RunParserResult> {
                         is_active: true,
                         location: offer.location,
                         rating: offer.rating,
-                        online_booking: offer.online_booking
+                        online_booking: offer.online_booking,
+                        source: sourceTag ?? undefined
                     }
                 },
                 upsert: true

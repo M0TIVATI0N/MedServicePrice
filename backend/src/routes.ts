@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import {
     fetchClinics,
     fetchNormalizedOffers,
+    countDistinctOffers,
     fetchUnmatchedQueue,
     fetchRawData,
     fetchPriceHistory,
@@ -12,8 +13,8 @@ import {
 } from "./parser";
 
 import { serviceCatalog, serviceSynonyms, resolveCatalogQuery } from "./service-catalog";
-import { getKdlCityNames } from "./parsers/kdlCities";
 import { OfferRecord } from "./db";
+import { SOURCES, sourceClinicFilter, sourcesClinicFilter } from "./sources";
 
 const router = Router();
 
@@ -104,22 +105,56 @@ const KNOWN_CATEGORIES: string[] = [
     "приём врача"
 ];
 
+function parseCitiesList(req: Request, fallbackCity: string): string[] {
+    const citiesParam = String(req.query.cities ?? "").trim();
+    if (citiesParam) {
+        return citiesParam.split(",").map(s => s.trim()).filter(Boolean);
+    }
+    return fallbackCity ? [fallbackCity] : [];
+}
+
+function parseSourcesList(req: Request): string[] {
+    const sourcesParam = String(req.query.sources ?? "").trim();
+    if (sourcesParam) {
+        return sourcesParam.split(",").map(s => s.trim()).filter(Boolean);
+    }
+    const source = String(req.query.source ?? "").trim();
+    return source ? [source] : [];
+}
+
+function applyCityFilter(filters: Record<string, any>, cities: string[]) {
+    if (cities.length === 1) filters.city = cities[0];
+    else if (cities.length > 1) filters.city = { $in: cities };
+}
+
+function appendAndFilter(filters: Record<string, any>, clause: Record<string, unknown>) {
+    if (!Object.keys(clause).length) return;
+    if (filters.$and) {
+        filters.$and.push(clause);
+    } else {
+        filters.$and = [clause];
+    }
+}
+
 function buildServiceFilters(req: Request) {
     const query        = String(req.query.query    ?? "").trim();
     const city         = String(req.query.city     ?? "").trim();
     const category     = String(req.query.category ?? "").trim();
+    const source       = String(req.query.source   ?? "").trim();
     const priceMin     = parseIntSafe(req.query.priceMin, 0, 0);
     const priceMax     = parseIntSafe(req.query.priceMax, Number.MAX_SAFE_INTEGER, 0);
     const ratingMin    = parseFloatSafe(req.query.ratingMin);
     const onlineOnly   = req.query.online_booking === "true";
     const serviceId    = String(req.query.service_id ?? "").trim();
+    const cities       = parseCitiesList(req, city);
+    const sources      = parseSourcesList(req);
 
     const filters: Record<string, any> = {};
 
     if (priceMin > 0 || priceMax < Number.MAX_SAFE_INTEGER) {
         filters.price_kzt = { $gte: priceMin, $lte: priceMax };
     }
-    if (city)         filters.city = city;
+    applyCityFilter(filters, cities);
     if (category)     filters.category = category;
     if (serviceId)    filters.service_id = serviceId;
     if (ratingMin !== null && ratingMin > 0) {
@@ -128,6 +163,12 @@ function buildServiceFilters(req: Request) {
     if (onlineOnly) {
         filters.online_booking = true;
     }
+    const srcFilter = sources.length
+        ? sourcesClinicFilter(sources)
+        : source
+            ? sourceClinicFilter(source)
+            : null;
+    if (srcFilter) appendAndFilter(filters, srcFilter);
     if (query) {
         const catalogMatches = resolveCatalogQuery(query);
         if (catalogMatches.length === 1) {
@@ -135,14 +176,38 @@ function buildServiceFilters(req: Request) {
         } else if (catalogMatches.length > 1) {
             filters.service_id = { $in: catalogMatches.map(s => s.service_id) };
         } else {
-            filters.$or = [
-                { service_name_norm: { $regex: query, $options: "i" } },
-                { service_name_raw:  { $regex: query, $options: "i" } }
-            ];
+            appendAndFilter(filters, {
+                $or: [
+                    { service_name_norm: { $regex: query, $options: "i" } },
+                    { service_name_raw:  { $regex: query, $options: "i" } }
+                ]
+            });
         }
     }
 
-    return { filters, query, city, category, priceMin, priceMax, ratingMin, onlineOnly, serviceId };
+    return { filters, query, city, cities, category, priceMin, priceMax, ratingMin, onlineOnly, serviceId, source, sources };
+}
+
+async function computePriceStats(filters: Record<string, any>) {
+    const rows = await OfferRecord.find(activeOfferFilter(filters))
+        .select("price_kzt")
+        .limit(5000)
+        .lean();
+
+    if (!rows.length) return null;
+
+    const prices = rows.map(r => r.price_kzt).sort((a, b) => a - b);
+    const sum = prices.reduce((s, p) => s + p, 0);
+    const mid = Math.floor(prices.length / 2);
+    const median = prices.length % 2 ? prices[mid] : (prices[mid - 1] + prices[mid]) / 2;
+
+    return {
+        count: prices.length,
+        avg: Math.round(sum / prices.length),
+        median: Math.round(median),
+        min: prices[0],
+        max: prices[prices.length - 1]
+    };
 }
 
 /* -------------------- HEALTH -------------------- */
@@ -184,6 +249,38 @@ router.get("/catalog/search", (req: Request, res: Response) => {
     res.json(results.slice(0, limit));
 });
 
+router.get("/sources", (_req: Request, res: Response) => {
+    res.json(SOURCES.map(s => ({ id: s.id, label: s.label })));
+});
+
+router.get("/sources/stats", async (req: Request, res: Response) => {
+    try {
+        const city = String(req.query.city ?? "").trim();
+        const base: Record<string, unknown> = city ? { city } : {};
+
+        const stats = await Promise.all(
+            SOURCES.map(async s => {
+                const srcFilter = sourceClinicFilter(s.id);
+                const match = activeOfferFilter({ ...base, ...(srcFilter ?? {}) });
+                const [offers, clinicIds] = await Promise.all([
+                    OfferRecord.countDocuments(match),
+                    OfferRecord.distinct("clinic_id", match)
+                ]);
+                return {
+                    id: s.id,
+                    label: s.label,
+                    offers,
+                    clinics: clinicIds.length
+                };
+            })
+        );
+
+        res.json(stats);
+    } catch (err: any) {
+        res.status(500).json({ error: err?.message ?? "Server error" });
+    }
+});
+
 /* -------------------- CITIES -------------------- */
 
 router.get("/cities", async (_req: Request, res: Response) => {
@@ -191,13 +288,12 @@ router.get("/cities", async (_req: Request, res: Response) => {
         const cached = citiesCache.get();
         if (cached) return res.json(cached);
 
-        const kdlCities = await getKdlCityNames();
         const fromDb = await OfferRecord.distinct(
             "city",
             activeOfferFilter({ city: { $nin: [null, ""] } })
         ) as string[];
 
-        const result = Array.from(new Set([...kdlCities, ...fromDb]))
+        const result = fromDb
             .filter(Boolean)
             .sort((a, b) => a.localeCompare(b, "ru"));
 
@@ -222,7 +318,7 @@ router.get("/categories", async (req: Request, res: Response) => {
             const result = (fromDb as string[])
                 .filter(Boolean)
                 .sort((a, b) => a.localeCompare(b, "ru"));
-            return res.json(result.length ? result : KNOWN_CATEGORIES);
+            return res.json(result);
         }
 
         const cached = categoriesCache.get();
@@ -250,9 +346,9 @@ router.get("/services", async (req: Request, res: Response) => {
         const userLat   = parseFloatSafe(req.query.lat);
         const userLng   = parseFloatSafe(req.query.lng);
 
-        const { filters, city } = buildServiceFilters(req);
+        const { filters, city, cities } = buildServiceFilters(req);
 
-        if (!city) {
+        if (!city && cities.length === 0) {
             return res.json({
                 count: 0,
                 page,
@@ -281,7 +377,7 @@ router.get("/services", async (req: Request, res: Response) => {
 
             const total = withDist.length;
             const data = withDist.slice((page - 1) * limit, page * limit);
-            const result = { count: total, page, limit, data };
+            const result = { count: total, page, limit, data, price_stats: await computePriceStats(filters) };
             setCachedServices(cacheKey, result);
             return res.json(result);
         }
@@ -293,12 +389,13 @@ router.get("/services", async (req: Request, res: Response) => {
             sort === "rating_desc" ? { rating: -1 } :
                                    { price_kzt: 1 };
 
-        const [offers, total] = await Promise.all([
+        const [offers, total, priceStats] = await Promise.all([
             fetchNormalizedOffers(activeFilters, sortField, page, limit),
-            OfferRecord.countDocuments(activeFilters)
+            countDistinctOffers(filters),
+            computePriceStats(filters)
         ]);
 
-        const result = { count: total, page, limit, data: offers };
+        const result = { count: total, page, limit, data: offers, price_stats: priceStats };
         setCachedServices(cacheKey, result);
         res.json(result);
     } catch (err: any) {
@@ -342,30 +439,47 @@ router.get("/compare", async (req: Request, res: Response) => {
 router.get("/clinics", async (req: Request, res: Response) => {
     try {
         const city = String(req.query.city ?? "").trim();
-        if (!city) {
+        const cities = parseCitiesList(req, city);
+        if (cities.length === 0) {
             return res.json([]);
         }
 
         const query = String(req.query.query ?? "").trim();
         const serviceId = String(req.query.service_id ?? "").trim();
+        const sources = parseSourcesList(req);
+        const source = String(req.query.source ?? "").trim();
+        const mapOnly = req.query.map === "true";
 
         const filters: Record<string, any> = {};
-        if (city) filters.city = city;
-        if (serviceId) {
-            filters.service_id = serviceId;
-        } else if (query) {
-            const catalogMatches = resolveCatalogQuery(query);
-            if (catalogMatches.length === 1) {
-                filters.service_id = catalogMatches[0].service_id;
-            } else if (catalogMatches.length > 1) {
-                filters.service_id = { $in: catalogMatches.map(s => s.service_id) };
-            } else {
-                filters.$or = [
-                    { service_name_norm: { $regex: query, $options: "i" } },
-                    { service_name_raw: { $regex: query, $options: "i" } }
-                ];
+        applyCityFilter(filters, cities);
+
+        const srcFilter = sources.length
+            ? sourcesClinicFilter(sources)
+            : source
+                ? sourceClinicFilter(source)
+                : null;
+
+        if (!mapOnly) {
+            if (serviceId) {
+                filters.service_id = serviceId;
+            } else if (query) {
+                const catalogMatches = resolveCatalogQuery(query);
+                if (catalogMatches.length === 1) {
+                    filters.service_id = catalogMatches[0].service_id;
+                } else if (catalogMatches.length > 1) {
+                    filters.service_id = { $in: catalogMatches.map(s => s.service_id) };
+                } else {
+                    appendAndFilter(filters, {
+                        $or: [
+                            { service_name_norm: { $regex: query, $options: "i" } },
+                            { service_name_raw: { $regex: query, $options: "i" } }
+                        ]
+                    });
+                }
             }
         }
+
+        if (srcFilter) appendAndFilter(filters, srcFilter);
 
         const clinics = await fetchClinics(filters);
         res.json(clinics);
@@ -377,27 +491,72 @@ router.get("/clinics", async (req: Request, res: Response) => {
 router.get("/clinics/:id", async (req: Request, res: Response) => {
     try {
         const clinic_id = req.params.id;
-        const offers = await OfferRecord.find(activeOfferFilter({ clinic_id }))
-            .sort({ price_kzt: 1 })
-            .lean();
+        const search = String(req.query.search ?? "").trim();
+        const limit = parseIntSafe(req.query.limit, 150, 1, 500);
 
-        if (!offers.length) {
+        const match: Record<string, unknown> = { clinic_id, ...activeOfferFilter({}) };
+
+        const pipeline: any[] = [
+            { $match: match },
+            { $sort: { price_kzt: 1, parsed_at: -1 } },
+            {
+                $group: {
+                    _id: "$service_id",
+                    service_id: { $first: "$service_id" },
+                    service_name_norm: { $first: "$service_name_norm" },
+                    service_name_raw: { $first: "$service_name_raw" },
+                    price_kzt: { $first: "$price_kzt" },
+                    category: { $first: "$category" },
+                    parsed_at: { $first: "$parsed_at" }
+                }
+            },
+            { $sort: { price_kzt: 1 } }
+        ];
+
+        if (search) {
+            pipeline.push({
+                $match: {
+                    $or: [
+                        { service_name_norm: { $regex: search, $options: "i" } },
+                        { service_name_raw: { $regex: search, $options: "i" } }
+                    ]
+                }
+            });
+        }
+
+        pipeline.push({ $limit: limit });
+
+        const countPipeline: any[] = [
+            { $match: match },
+            { $group: { _id: "$service_id" } },
+            { $count: "total" }
+        ];
+
+        const [meta, services, countResult] = await Promise.all([
+            OfferRecord.findOne(activeOfferFilter({ clinic_id })).lean(),
+            OfferRecord.aggregate(pipeline).exec(),
+            OfferRecord.aggregate(countPipeline).exec()
+        ]);
+
+        if (!meta) {
             return res.status(404).json({ error: "Clinic not found" });
         }
 
-        const first = offers[0];
+        const totalServices = countResult[0]?.total ?? services.length;
+
         res.json({
-            clinic_id:     first.clinic_id,
-            clinic_name:   first.clinic_name,
-            city:          first.city,
-            address:       first.address,
-            phone:         first.phone,
-            working_hours: first.working_hours,
-            source_url:    first.source_url,
-            location:      first.location,
-            rating:        first.rating,
-            online_booking: first.online_booking,
-            services:      offers
+            clinic_id: meta.clinic_id,
+            clinic_name: meta.clinic_name,
+            city: meta.city,
+            address: meta.address,
+            phone: meta.phone,
+            working_hours: meta.working_hours,
+            source_url: meta.source_url,
+            location: meta.location,
+            rating: meta.rating,
+            online_booking: meta.online_booking,
+            service_count: totalServices,
+            services
         });
     } catch (err: any) {
         res.status(500).json({ error: err?.message ?? "Server error" });

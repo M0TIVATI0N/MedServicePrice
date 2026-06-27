@@ -111,6 +111,202 @@ select {
   border-color: #a5b4fc;
 }
 
+.chip-active {
+  background: #4f46e5;
+  border-color: #4f46e5;
+  color: #fff;
+}
+
+.chip-active:hover {
+  background: #4338ca;
+  border-color: #4338ca;
+}
+
+.compare-cities-panel {
+  margin-top: 16px;
+  padding: 20px 24px;
+  border-radius: 20px;
+  background: #fff;
+  border: 1px solid #eef0f5;
+}
+
+.compare-cities-panel label {
+  display: block;
+  margin-bottom: 10px;
+  font-weight: 600;
+  color: #334155;
+}
+
+.compare-cities-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-weight: 600;
+  color: #334155;
+  cursor: pointer;
+  text-align: left;
+}
+
+.compare-count {
+  margin-left: auto;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #3730a3;
+  font-size: 0.85rem;
+}
+
+.sources-group {
+  grid-column: 1 / -1;
+}
+
+.source-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chip-no-data {
+  opacity: 0.55;
+  border-style: dashed;
+}
+
+.chip-stat {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.25);
+  font-size: 0.75rem;
+}
+
+.chip-active .chip-stat {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.sources-hint-warn {
+  color: #b45309;
+}
+
+.source-badge-planned {
+  opacity: 0.65;
+  border-style: dashed;
+}
+
+.sources-hint {
+  display: block;
+  margin-top: 6px;
+  font-size: 0.82rem;
+  color: #64748b;
+}
+
+.badge-city {
+  background: #f1f5f9;
+  color: #475569;
+  margin-bottom: 8px;
+}
+
+.services-more-hint {
+  margin-top: 8px;
+  font-size: 0.85rem;
+}
+
+.compare-cities-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.compare-cities-results {
+  margin-bottom: 20px;
+  padding: 16px 20px;
+  border-radius: 16px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+}
+
+.compare-cities-results h3 {
+  margin: 0 0 12px;
+  font-size: 1rem;
+  color: #334155;
+}
+
+.compare-city-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.compare-city-row:last-child {
+  border-bottom: none;
+}
+
+.price-stats-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px 24px;
+  margin-bottom: 16px;
+  padding: 12px 16px;
+  border-radius: 12px;
+  background: #eef2ff;
+  color: #3730a3;
+  font-size: 0.9rem;
+}
+
+.freshness-badge {
+  font-size: 0.8rem;
+  color: #64748b;
+  white-space: nowrap;
+}
+
+.deviation {
+  margin: 4px 0 0;
+  font-size: 0.85rem;
+  color: #64748b;
+}
+
+.deviation-good {
+  color: #059669;
+}
+
+.deviation-bad {
+  color: #dc2626;
+}
+
+.badge-source {
+  background: #e0e7ff;
+  color: #3730a3;
+}
+
+.button-active {
+  background: #4f46e5 !important;
+  color: #fff !important;
+  border-color: #4f46e5 !important;
+}
+
+.clinic-search-input {
+  width: 100%;
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid #d7dbe9;
+  font-size: 0.95rem;
+}
+
+.clinic-search-input:focus {
+  outline: none;
+  border-color: #818cf8;
+  box-shadow: 0 0 0 3px rgba(129, 140, 248, 0.25);
+}
+
 .active-filters {
   display: flex;
   flex-wrap: wrap;

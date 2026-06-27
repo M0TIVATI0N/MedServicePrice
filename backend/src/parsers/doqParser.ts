@@ -27,7 +27,7 @@ const dispatcher = new Agent({
 
     bodyTimeout: 15000,
 
-    headersTimeout: 10000
+    headersTimeout: 30000
 
 });
 
@@ -74,12 +74,13 @@ async function fetchAllDoctors(cityId: number): Promise<any[]> {
         offsets.push(offset);
     }
 
-    const pages = await Promise.all(
-        offsets.map(offset => getJson<any>(`${base}&offset=${offset}`))
-    );
-
-    for (const page of pages) {
-        if (page?.results) results.push(...page.results);
+    for (const offset of offsets) {
+        try {
+            const page = await getJson<any>(`${base}&offset=${offset}`);
+            if (page?.results) results.push(...page.results);
+        } catch (err: any) {
+            console.warn(`DOQ city ${cityId} offset ${offset}:`, err?.message ?? err);
+        }
     }
 
     return results;
@@ -163,21 +164,27 @@ function doctorsToRecords(
 
 
 
+            const doctorUrl = doctor.slug
+                ? `https://doq.kz/doctors/${doctor.slug}`
+                : branch.clinic_slug
+                    ? `https://doq.kz/clinics/${city.slug}/${branch.clinic_slug}`
+                    : `https://doq.kz/?city=${city.slug}`;
+
             out.push({
 
                 clinic_id: clinicId,
 
-                clinic_name: branch.name ?? "Клиника DOQ",
+                clinic_name: branch.name ?? doctor.full_name ?? "Клиника DOQ",
 
                 city: city.name,
 
                 address: branch.address ?? "не указан",
 
-                phone: branch.phones?.[0] ?? "",
+                phone: branch.phones?.[0] ?? doctor.phone ?? "",
 
                 working_hours: "09:00-20:00",
 
-                source_url: `https://doq.kz/clinics/${city.slug}/${branch.clinic_slug ?? branch.slug}`,
+                source_url: doctorUrl,
 
                 service_name_raw: name,
 
@@ -254,23 +261,19 @@ export async function parseDoqPrices(): Promise<RawClinicRecord[]> {
 
 
 
-    const perCity = await Promise.all(
+    const perCity: RawClinicRecord[][] = [];
 
-        cities.map(async city => {
-
+    for (const city of cities) {
+        try {
             const doctors = await fetchAllDoctors(city.id);
-
             const records = doctorsToRecords(city, doctors, parsedAt);
-
             console.log(`DOQ ${city.name}: ${records.length} offers`);
-
-            return records;
-
-        })
-
-    );
-
-
+            perCity.push(records);
+        } catch (err: any) {
+            console.warn(`DOQ ${city.name} failed:`, err?.message ?? err);
+            perCity.push([]);
+        }
+    }
 
     const results = perCity.flat();
 

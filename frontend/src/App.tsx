@@ -7,6 +7,7 @@ import 'leaflet/dist/leaflet.css';
 import { fetchJson, asArray } from './api';
 import { CollapsiblePanel } from './CollapsiblePanel';
 import { publicSourceUrl } from './clinicUrl';
+import { formatFreshness, priceDeviation, deviationLabel, sourceLabel } from './utils';
 
 interface ServiceOffer {
   clinic_id: string;
@@ -63,6 +64,31 @@ interface Stats {
   catalog_size: number;
   freshness_days: number;
 }
+
+interface PriceStats {
+  count: number;
+  avg: number;
+  median: number;
+  min: number;
+  max: number;
+}
+
+interface SourceStat {
+  id: string;
+  label: string;
+  offers: number;
+  clinics: number;
+}
+
+const SOURCE_OPTIONS = [
+  { id: 'KDL', label: 'KDL' },
+  { id: 'DOQ', label: 'DOQ' },
+  { id: 'INVITRO', label: 'ИНВИТРО' },
+  { id: 'HELIX', label: 'Helix' },
+  { id: 'GEMOTEST', label: 'Гемотест' }
+] as const;
+
+const PLANNED_SOURCES = ['Olymp', 'МЕДЭЛ', 'МЦК', '2GIS'] as const;
 
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({ iconUrl, shadowUrl: iconShadowUrl, iconRetinaUrl: iconUrl });
@@ -122,27 +148,34 @@ export default function App() {
   const mapsUrl = import.meta.env.VITE_GOOGLE_MAPS_URL || 'https://www.google.com/maps/dir/?api=1';
 
   const [city, setCity] = useState('');
+  const [compareCities, setCompareCities] = useState<string[]>([]);
+  const [compareCitiesOpen, setCompareCitiesOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [selectedServiceId, setSelectedServiceId] = useState('');
   const [category, setCategory] = useState('');
+  const [selectedSources, setSelectedSources] = useState<string[]>([]);
   const [priceMin, setPriceMin] = useState('0');
   const [priceMax, setPriceMax] = useState('100000');
   const [ratingMin, setRatingMin] = useState('0');
   const [onlineOnly, setOnlineOnly] = useState(false);
   const [sort, setSort] = useState('price_asc');
   const [page, setPage] = useState(1);
+  const [nearMeActive, setNearMeActive] = useState(false);
   const [userLocation, setUserLocation] = useState<{ lat: number; lng: number } | null>(null);
 
   const [offers, setOffers] = useState<ServiceOffer[]>([]);
   const [totalCount, setTotalCount] = useState(0);
+  const [priceStats, setPriceStats] = useState<PriceStats | null>(null);
   const [clinics, setClinics] = useState<Clinic[]>([]);
   const [selectedClinic, setSelectedClinic] = useState<Clinic | null>(null);
   const [clinicPanelOpen, setClinicPanelOpen] = useState(true);
+  const [clinicServiceSearch, setClinicServiceSearch] = useState('');
   const [cities, setCities] = useState<string[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
   const [catalogHints, setCatalogHints] = useState<CatalogItem[]>([]);
   const [showHints, setShowHints] = useState(false);
   const [stats, setStats] = useState<Stats | null>(null);
+  const [sourceStats, setSourceStats] = useState<SourceStat[]>([]);
 
   const [compareIds, setCompareIds] = useState<Set<string>>(new Set());
   const [showCompare, setShowCompare] = useState(false);
@@ -161,9 +194,12 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
 
   const searchRef = useRef<HTMLDivElement>(null);
+  const resultsRef = useRef<HTMLElement>(null);
   const historyRef = useRef<HTMLElement>(null);
   const clinicPanelRef = useRef<HTMLElement>(null);
+  const clinicCacheRef = useRef<Map<string, Clinic>>(new Map());
   const debouncedQuery = useDebounce(query, 400);
+  const debouncedClinicSearch = useDebounce(clinicServiceSearch, 300);
 
   useEffect(() => {
     fetchJson<string[]>(`${apiBase}/cities`).then(d => setCities(asArray(d))).catch(() => {});
@@ -175,14 +211,21 @@ export default function App() {
       setCategories([]);
       setOffers([]);
       setTotalCount(0);
+      setPriceStats(null);
       setClinics([]);
       setSelectedClinic(null);
       setCompareIds(new Set());
+      setCompareCities([]);
+      setSourceStats([]);
       return;
     }
+    setCompareCities(prev => prev.filter(c => c !== city));
     fetchJson<string[]>(`${apiBase}/categories?city=${encodeURIComponent(city)}`)
       .then(d => setCategories(asArray(d)))
       .catch(() => setCategories([]));
+    fetchJson<SourceStat[]>(`${apiBase}/sources/stats?city=${encodeURIComponent(city)}`)
+      .then(d => setSourceStats(asArray(d)))
+      .catch(() => setSourceStats([]));
   }, [apiBase, city]);
 
   useEffect(() => {
@@ -200,20 +243,32 @@ export default function App() {
     return () => document.removeEventListener('mousedown', handler);
   }, []);
 
-  useEffect(() => { setPage(1); }, [debouncedQuery, selectedServiceId, city, category, priceMin, priceMax, ratingMin, onlineOnly, sort, userLocation]);
+  useEffect(() => { setPage(1); }, [debouncedQuery, selectedServiceId, city, compareCities, category, selectedSources, priceMin, priceMax, ratingMin, onlineOnly, sort, nearMeActive, userLocation]);
 
-  const searchParams = useMemo(() => {
+  const searchCities = useMemo(
+    () => (city ? [city, ...compareCities.filter(c => c !== city)] : []),
+    [city, compareCities]
+  );
+
+  const baseFilterParams = useMemo(() => {
     const p = new URLSearchParams();
-    if (!city) return '';
-    p.set('city', city);
     if (selectedServiceId) p.set('service_id', selectedServiceId);
     else if (debouncedQuery.trim()) p.set('query', debouncedQuery.trim());
     if (category) p.set('category', category);
+    if (selectedSources.length) p.set('sources', selectedSources.join(','));
     if (Number(priceMin) > 0) p.set('priceMin', priceMin);
     if (Number(priceMax) < 100000) p.set('priceMax', priceMax);
     if (Number(ratingMin) > 0) p.set('ratingMin', ratingMin);
     if (onlineOnly) p.set('online_booking', 'true');
-    if (userLocation && sort === 'distance') {
+    return p;
+  }, [debouncedQuery, selectedServiceId, category, selectedSources, priceMin, priceMax, ratingMin, onlineOnly]);
+
+  const searchParams = useMemo(() => {
+    if (!searchCities.length) return '';
+    const p = new URLSearchParams(baseFilterParams);
+    if (searchCities.length > 1) p.set('cities', searchCities.join(','));
+    p.set('city', city);
+    if (nearMeActive && userLocation && sort === 'distance') {
       p.set('lat', String(userLocation.lat));
       p.set('lng', String(userLocation.lng));
     }
@@ -221,44 +276,77 @@ export default function App() {
     p.set('page', String(page));
     p.set('limit', String(PAGE_SIZE));
     return p.toString();
-  }, [debouncedQuery, selectedServiceId, city, category, priceMin, priceMax, ratingMin, onlineOnly, sort, page, userLocation]);
+  }, [baseFilterParams, searchCities, city, sort, page, nearMeActive, userLocation]);
 
-  const clinicParams = useMemo(() => {
-    if (!city) return '';
+  const mapClinicParams = useMemo(() => {
+    if (!searchCities.length) return '';
     const p = new URLSearchParams();
+    if (searchCities.length > 1) p.set('cities', searchCities.join(','));
     p.set('city', city);
-    if (selectedServiceId) p.set('service_id', selectedServiceId);
-    else if (debouncedQuery.trim()) p.set('query', debouncedQuery.trim());
+    p.set('map', 'true');
+    if (selectedSources.length) p.set('sources', selectedSources.join(','));
     return p.toString();
-  }, [city, debouncedQuery, selectedServiceId]);
+  }, [searchCities, city, selectedSources]);
 
   useEffect(() => {
-    if (!city || !searchParams) {
+    if (!searchCities.length || !searchParams) {
       setOffers([]);
       setTotalCount(0);
+      setPriceStats(null);
       return;
     }
     setLoading(true);
     setError(null);
     const controller = new AbortController();
-    fetchJson<{ data?: ServiceOffer[]; count?: number }>(`${apiBase}/services?${searchParams}`, controller.signal)
+    fetchJson<{ data?: ServiceOffer[]; count?: number; price_stats?: PriceStats | null }>(
+      `${apiBase}/services?${searchParams}`, controller.signal
+    )
       .then(data => {
-        setOffers(asArray(data?.data));
-        setTotalCount(data?.count ?? 0);
+        if (!data) {
+          setError('Не удалось загрузить данные.');
+          return;
+        }
+        setOffers(asArray(data.data));
+        setTotalCount(data.count ?? 0);
+        setPriceStats(data.price_stats ?? null);
       })
       .catch(err => {
         if (err.name !== 'AbortError') setError('Не удалось загрузить данные.');
       })
       .finally(() => setLoading(false));
     return () => controller.abort();
-  }, [apiBase, searchParams, city]);
+  }, [apiBase, searchParams, searchCities]);
 
   useEffect(() => {
-    if (!city || !clinicParams) { setClinics([]); return; }
-    fetchJson<Clinic[]>(`${apiBase}/clinics?${clinicParams}`)
+    if (!searchCities.length || !mapClinicParams) { setClinics([]); return; }
+    fetchJson<Clinic[]>(`${apiBase}/clinics?${mapClinicParams}`)
       .then(d => setClinics(asArray(d)))
       .catch(() => setClinics([]));
-  }, [apiBase, clinicParams, city]);
+  }, [apiBase, mapClinicParams, searchCities]);
+
+  useEffect(() => {
+    if (!selectedClinic) return;
+    const cacheKey = `${selectedClinic.clinic_id}|${debouncedClinicSearch}`;
+    const cached = clinicCacheRef.current.get(cacheKey);
+    if (cached) {
+      setSelectedClinic(cached);
+      setClinicLoading(false);
+      return;
+    }
+    setClinicLoading(true);
+    const q = debouncedClinicSearch.trim();
+    const url = q
+      ? `${apiBase}/clinics/${selectedClinic.clinic_id}?search=${encodeURIComponent(q)}&limit=500`
+      : `${apiBase}/clinics/${selectedClinic.clinic_id}?limit=500`;
+    fetchJson<Clinic>(url)
+      .then(full => {
+        if (full) {
+          clinicCacheRef.current.set(cacheKey, full);
+          setSelectedClinic(full);
+        }
+      })
+      .finally(() => setClinicLoading(false));
+  }, [apiBase, selectedClinic?.clinic_id, debouncedClinicSearch]);
 
   useEffect(() => {
     if (!historyOffer) { setHistory([]); return; }
@@ -269,18 +357,12 @@ export default function App() {
 
   const mapCenter = selectedClinic?.location ?? clinics.find(c => c.location)?.location ?? userLocation ?? DEFAULT_CENTER;
 
-  const handleSelectClinic = useCallback(async (clinic: Clinic) => {
-    setSelectedClinic({ ...clinic, services: clinic.services ?? [] });
+  const handleSelectClinic = useCallback((clinic: Clinic) => {
+    setSelectedClinic({ ...clinic, services: [] });
+    setClinicServiceSearch('');
     setClinicPanelOpen(true);
-    setClinicLoading(true);
-    try {
-      const full = await fetchJson<Clinic>(`${apiBase}/clinics/${clinic.clinic_id}`);
-      if (full) setSelectedClinic(full);
-    } finally {
-      setClinicLoading(false);
-      setTimeout(() => clinicPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
-    }
-  }, [apiBase]);
+    setTimeout(() => clinicPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
+  }, []);
 
   const toggleCompare = useCallback((offer: ServiceOffer) => {
     setCompareIds(prev => {
@@ -310,13 +392,26 @@ export default function App() {
     setTimeout(() => historyRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
   }, []);
 
-  const requestLocation = useCallback(() => {
-    if (!navigator.geolocation) return;
+  const toggleNearMe = useCallback(() => {
+    if (nearMeActive) {
+      setNearMeActive(false);
+      setUserLocation(null);
+      if (sort === 'distance') setSort('price_asc');
+      return;
+    }
+    if (!navigator.geolocation) {
+      setError('Геолокация недоступна в браузере.');
+      return;
+    }
     navigator.geolocation.getCurrentPosition(
-      pos => { setUserLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude }); setSort('distance'); },
+      pos => {
+        setUserLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        setNearMeActive(true);
+        setSort('distance');
+      },
       () => setError('Не удалось определить геолокацию.')
     );
-  }, []);
+  }, [nearMeActive, sort]);
 
   const triggerParse = useCallback(() => {
     setParsing(true);
@@ -344,7 +439,10 @@ export default function App() {
                     : 'Парсинг завершён. Нажмите «Обновить прайсы» ещё раз, если данных нет.'
                 );
                 fetchJson<string[]>(`${apiBase}/cities`).then(d => setCities(asArray(d)));
-                if (city) fetchJson<string[]>(`${apiBase}/categories?city=${encodeURIComponent(city)}`).then(d => setCategories(asArray(d)));
+                if (city) {
+                  fetchJson<string[]>(`${apiBase}/categories?city=${encodeURIComponent(city)}`).then(d => setCategories(asArray(d)));
+                  fetchJson<SourceStat[]>(`${apiBase}/sources/stats?city=${encodeURIComponent(city)}`).then(d => setSourceStats(asArray(d)));
+                }
                 return;
               }
               setTimeout(poll, 2000);
@@ -368,6 +466,7 @@ export default function App() {
     setQuery('');
     setSelectedServiceId('');
     setCategory('');
+    setSelectedSources([]);
     setPriceMin('0');
     setPriceMax('100000');
     setRatingMin('0');
@@ -375,7 +474,27 @@ export default function App() {
     setSort('price_asc');
   };
 
-  const hasActiveFilters = !!(query || selectedServiceId || category || Number(priceMin) > 0 || Number(priceMax) < 100000 || Number(ratingMin) > 0 || onlineOnly);
+  const toggleCompareCity = (c: string) => {
+    setCompareCities(prev => prev.includes(c) ? prev.filter(x => x !== c) : [...prev, c]);
+  };
+
+  const toggleSource = (id: string) => {
+    setSelectedSources(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  };
+
+  const goToPage = (next: number) => {
+    setPage(next);
+    setTimeout(() => resultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
+  };
+
+  const sourceStatMap = useMemo(
+    () => Object.fromEntries(sourceStats.map(s => [s.id, s])),
+    [sourceStats]
+  );
+
+  const showCategoryFilter = categories.length > 1;
+  const compareCityOptions = cities.filter(c => c !== city);
+  const hasActiveFilters = !!(query || selectedServiceId || category || selectedSources.length || Number(priceMin) > 0 || Number(priceMax) < 100000 || Number(ratingMin) > 0 || onlineOnly);
   const totalPages = Math.ceil(totalCount / PAGE_SIZE);
   const clinicsWithLocation = clinics.filter(c => c.location);
   const lowestPrice = offers.length > 0 ? Math.min(...offers.map(o => o.price_kzt)) : null;
@@ -389,6 +508,7 @@ export default function App() {
           <p className="subtitle">Как Aviasales, но для медицины — сначала выберите город, затем сравнивайте цены клиник.</p>
           <div className="source-badges">
             {DATA_SOURCES.map(s => <span key={s} className="source-badge">{s}</span>)}
+            {PLANNED_SOURCES.map(s => <span key={s} className="source-badge source-badge-planned">{s} · скоро</span>)}
           </div>
           {stats && (
             <p className="stats-bar">
@@ -407,16 +527,44 @@ export default function App() {
       <main className="panel">
         <section className="city-gate">
           <div className="control-group city-gate-select">
-            <label>1. Выберите город ({cities.length || '…'} доступно)</label>
+            <label>1. Выберите город ({cities.length || '…'} с данными)</label>
             <select value={city} onChange={e => setCity(e.target.value)} className="city-select-large">
               <option value="">— Выберите город —</option>
               {cities.map(c => <option key={c} value={c}>{c}</option>)}
             </select>
           </div>
           {!city && (
-            <p className="city-gate-hint">После выбора города загрузятся клиники, карта и цены на услуги в вашем регионе.</p>
+            <p className="city-gate-hint">Показаны только города, где есть актуальные предложения. После выбора загрузятся клиники и цены.</p>
           )}
         </section>
+
+        {city && compareCityOptions.length > 0 && (
+          <section className="compare-cities-panel">
+            <button
+              type="button"
+              className="compare-cities-toggle"
+              onClick={() => setCompareCitiesOpen(v => !v)}
+            >
+              <span className={`chevron ${compareCitiesOpen ? 'open' : ''}`} aria-hidden>›</span>
+              Сравнить с другими городами (необязательно)
+              {compareCities.length > 0 && <span className="compare-count">{compareCities.length}</span>}
+            </button>
+            {compareCitiesOpen && (
+              <div className="compare-cities-chips">
+                {compareCityOptions.map(c => (
+                  <button
+                    key={c}
+                    type="button"
+                    className={`chip ${compareCities.includes(c) ? 'chip-active' : ''}`}
+                    onClick={() => toggleCompareCity(c)}
+                  >
+                    {c}
+                  </button>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
 
         {city && (
           <>
@@ -447,12 +595,42 @@ export default function App() {
                 </div>
               </div>
 
+              {showCategoryFilter && (
               <div className="control-group">
                 <label>Категория</label>
                 <select value={category} onChange={e => setCategory(e.target.value)}>
                   <option value="">Все категории</option>
                   {categories.map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
+              </div>
+              )}
+              <div className="control-group sources-group">
+                <label>Источники данных (по ТЗ)</label>
+                <div className="source-chips">
+                  {SOURCE_OPTIONS.map(s => {
+                    const stat = sourceStatMap[s.id];
+                    const hasData = !stat || stat.offers > 0;
+                    return (
+                      <button
+                        key={s.id}
+                        type="button"
+                        className={`chip ${selectedSources.includes(s.id) ? 'chip-active' : ''} ${!hasData ? 'chip-no-data' : ''}`}
+                        onClick={() => toggleSource(s.id)}
+                        title={stat ? `${stat.offers} предложений · ${stat.clinics} клиник` : undefined}
+                      >
+                        {s.label}
+                        {stat && <span className="chip-stat">{stat.clinics || '—'}</span>}
+                      </button>
+                    );
+                  })}
+                </div>
+                {selectedSources.length === 0 ? (
+                  <span className="sources-hint">Не выбрано — показываются все источники с данными в городе</span>
+                ) : selectedSources.every(id => sourceStatMap[id]?.offers === 0) ? (
+                  <span className="sources-hint sources-hint-warn">Выбранные источники не содержат данных в этом городе. Нажмите «Обновить прайсы».</span>
+                ) : (
+                  <span className="sources-hint">Цифра на кнопке — число клиник источника в городе</span>
+                )}
               </div>
               <div className="control-group">
                 <label>Цена от (тг)</label>
@@ -497,8 +675,14 @@ export default function App() {
             )}
 
             <section className="toolbar">
-              <span className="city-badge">{city}</span>
-              <button type="button" className="secondary-button" onClick={requestLocation}>Рядом со мной</button>
+              <span className="city-badge">{searchCities.join(' · ')}</span>
+              <button
+                type="button"
+                className={`secondary-button ${nearMeActive ? 'button-active' : ''}`}
+                onClick={toggleNearMe}
+              >
+                {nearMeActive ? '✓ Рядом со мной' : 'Рядом со мной'}
+              </button>
               <button type="button" className="secondary-button" onClick={() => setShowMap(v => !v)}>
                 {showMap ? 'Скрыть карту' : 'Показать карту'}
               </button>
@@ -512,7 +696,7 @@ export default function App() {
 
             {selectedClinic && (
               <CollapsiblePanel
-                title={`${selectedClinic.clinic_name} — услуги (${selectedClinic.services?.length ?? selectedClinic.service_count ?? '…'})`}
+                title={`${selectedClinic.clinic_name} — услуги (${selectedClinic.service_count ?? selectedClinic.services?.length ?? '…'})`}
                 open={clinicPanelOpen}
                 onToggle={() => setClinicPanelOpen(v => !v)}
                 onClose={() => setSelectedClinic(null)}
@@ -528,14 +712,28 @@ export default function App() {
                 {clinicLoading ? (
                   <p className="status"><span className="spinner" /> Загрузка услуг...</p>
                 ) : (
-                  <ul className="history-list services-scroll">
-                    {(selectedClinic.services ?? []).slice().sort((a, b) => a.price_kzt - b.price_kzt).map((s, i) => (
-                      <li key={i}>
-                        <span>{s.service_name_norm || s.service_name_raw}</span>
-                        <strong>{s.price_kzt.toLocaleString('ru-RU')} тг</strong>
-                      </li>
-                    ))}
-                  </ul>
+                  <>
+                    <input
+                      className="clinic-search-input"
+                      placeholder="Поиск по услугам клиники..."
+                      value={clinicServiceSearch}
+                      onChange={e => setClinicServiceSearch(e.target.value)}
+                    />
+                    <ul className="history-list services-scroll">
+                      {(selectedClinic.services ?? []).map((s, i) => (
+                        <li key={`${s.service_id}-${i}`}>
+                          <span>{s.service_name_norm || s.service_name_raw}</span>
+                          <strong>{s.price_kzt.toLocaleString('ru-RU')} тг</strong>
+                        </li>
+                      ))}
+                    </ul>
+                    {selectedClinic.service_count != null &&
+                      (selectedClinic.services?.length ?? 0) < selectedClinic.service_count && (
+                      <p className="muted services-more-hint">
+                        Показано {(selectedClinic.services?.length ?? 0).toLocaleString('ru-RU')} из {selectedClinic.service_count.toLocaleString('ru-RU')}. Уточните поиск.
+                      </p>
+                    )}
+                  </>
                 )}
               </CollapsiblePanel>
             )}
@@ -610,28 +808,42 @@ export default function App() {
               </section>
             )}
 
-            <section className="results">
+            <section className="results" ref={resultsRef}>
               <div className="results-header">
-                <h2>Результаты — {city}</h2>
+                <h2>Результаты — {searchCities.join(', ')}</h2>
                 <span>{loading ? '...' : `${totalCount} предложений · ${clinics.length} клиник`}</span>
               </div>
+
+              {priceStats && priceStats.count > 0 && (
+                <div className="price-stats-bar">
+                  <span>Средняя: <strong>{priceStats.avg.toLocaleString('ru-RU')} тг</strong></span>
+                  <span>Медиана: <strong>{priceStats.median.toLocaleString('ru-RU')} тг</strong></span>
+                  <span>Диапазон: {priceStats.min.toLocaleString('ru-RU')}–{priceStats.max.toLocaleString('ru-RU')} тг</span>
+                </div>
+              )}
 
               {loading && <p className="status"><span className="spinner" /> Загрузка...</p>}
               {error && <p className="status status-error">{error}</p>}
               {!loading && !error && offers.length === 0 && (
                 <div className="empty-state">
                   <p className="empty-title">В городе {city} предложений не найдено</p>
-                  <p className="empty-hint">Попробуйте другую услугу или нажмите «Обновить прайсы» для загрузки данных по этому городу.</p>
+                  <p className="empty-hint">
+                    {selectedSources.length > 0
+                      ? 'Выбранные источники не содержат данных по этому запросу. Снимите фильтр источников или нажмите «Обновить прайсы».'
+                      : 'Попробуйте другую услугу или нажмите «Обновить прайсы» для загрузки данных по этому городу.'}
+                  </p>
                 </div>
               )}
 
-              <div className="grid">
+              <div className="grid" key={`page-${page}`}>
                 {offers.map(offer => {
                   const key = offerKey(offer);
                   const isCompared = compareIds.has(key);
                   const isBestPrice = lowestPrice !== null && offer.price_kzt === lowestPrice && offers.length > 1;
                   const clinicSummary = clinics.find(c => c.clinic_id === offer.clinic_id);
                   const siteUrl = publicSourceUrl(offer.clinic_id, offer.source_url);
+                  const src = sourceLabel(offer.clinic_id);
+                  const devPct = priceStats ? priceDeviation(offer.price_kzt, priceStats.median) : 0;
                   return (
                     <article key={`${key}-${offer.city}`} className={`card ${isCompared ? 'card-selected' : ''}`}>
                       <div className="card-header">
@@ -640,20 +852,29 @@ export default function App() {
                             clinic_id: offer.clinic_id, clinic_name: offer.clinic_name, city: offer.city,
                             address: offer.address, phone: offer.phone, working_hours: offer.working_hours,
                             source_url: offer.source_url, rating: offer.rating, online_booking: offer.online_booking,
-                            location: offer.location
+                            location: offer.location, service_count: 0
                           })}>{offer.clinic_name}</button>
                         </h3>
                         <div className="card-badges">
                           {isBestPrice && <span className="badge badge-best">Лучшая цена</span>}
-                          <span className="badge">{offer.category}</span>
+                          {src && <span className="badge badge-source">{src}</span>}
+                          {showCategoryFilter && <span className="badge">{offer.category}</span>}
                           {offer.online_booking && <span className="badge badge-green">Онлайн</span>}
                         </div>
                       </div>
                       <p className="service-name">{offer.service_name_norm || offer.service_name_raw}</p>
+                      {searchCities.length > 1 && (
+                        <span className="badge badge-city">{offer.city}</span>
+                      )}
                       <div className="price-row">
                         <strong>{offer.price_kzt.toLocaleString('ru-RU')} тг</strong>
-                        <span>{new Date(offer.parsed_at).toLocaleDateString('ru-RU')}</span>
+                        <span className="freshness-badge" title="Дата обновления">{formatFreshness(offer.parsed_at)}</span>
                       </div>
+                      {priceStats && (
+                        <p className={`deviation ${devPct < 0 ? 'deviation-good' : devPct > 10 ? 'deviation-bad' : ''}`}>
+                          {deviationLabel(devPct)} (медиана {priceStats.median.toLocaleString('ru-RU')} тг)
+                        </p>
+                      )}
                       <div className="clinic-meta">
                         {offer.rating && <p>Рейтинг: {offer.rating.toFixed(1)} ★</p>}
                         {offer.distance_km !== undefined && offer.distance_km < 1e6 && <p>{offer.distance_km.toFixed(1)} км от вас</p>}
@@ -681,9 +902,9 @@ export default function App() {
 
               {totalPages > 1 && (
                 <div className="pagination">
-                  <button type="button" disabled={page <= 1} onClick={() => setPage(p => p - 1)}>Назад</button>
+                  <button type="button" disabled={page <= 1 || loading} onClick={() => goToPage(page - 1)}>Назад</button>
                   <span>Страница {page} из {totalPages}</span>
-                  <button type="button" disabled={page >= totalPages} onClick={() => setPage(p => p + 1)}>Вперёд</button>
+                  <button type="button" disabled={page >= totalPages || loading} onClick={() => goToPage(page + 1)}>Вперёд</button>
                 </div>
               )}
             </section>

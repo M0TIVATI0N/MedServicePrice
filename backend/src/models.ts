@@ -48,6 +48,7 @@ export interface NormalizedService {
 export interface ClinicServiceOffer extends RawClinicRecord {
     service_id: string;
     service_name_norm: string;
+    source?: string;
 }
 
 export interface PriceHistoryEntry {

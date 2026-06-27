@@ -1,5 +1,5 @@
 import dotenv from "dotenv";
-import mongoose, { Document, Model, Schema } from "mongoose";
+import mongoose, { Document, Model, Schema, SortOrder } from "mongoose";
 
 import {
     MapLocation,
@@ -150,7 +150,8 @@ const OfferRecordSchema = new Schema<OfferRecordDoc>(
 
         location: locationSchema,
         rating: Number,
-        online_booking: { type: Boolean, index: true }
+        online_booking: { type: Boolean, index: true },
+        source: { type: String, index: true }
     },
     {
         ...schemaOptions,
@@ -162,7 +163,7 @@ OfferRecordSchema.index(
     {
         clinic_id: 1,
         service_id: 1,
-        source_url: 1
+        city: 1
     },
     { unique: true }
 );

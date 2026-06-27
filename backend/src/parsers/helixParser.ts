@@ -1,119 +1,102 @@
-import * as cheerio from "cheerio";
 import { Agent, fetch } from "undici";
 import { RawClinicRecord } from "../models";
 import { cityLocation } from "../geocoding";
-import { limitCities } from "./config";
 
-const BASE = "https://helix.kz";
+const HELIX_WEB = "https://helix.ru";
+const HELIX_API = "https://helixru-webapi-prod.medindex.ru/api";
 
 const dispatcher = new Agent({
-    connect: { rejectUnauthorized: false },
+    connect: { rejectUnauthorized: false, timeout: 30_000 },
     connections: 10,
-    pipelining: 1,
     keepAliveTimeout: 30000,
-    bodyTimeout: 30000,
-    headersTimeout: 15000
+    bodyTimeout: 45000,
+    headersTimeout: 20000
 });
 
 const HEADERS = {
-    Accept: "text/html",
-    "User-Agent": "Mozilla/5.0 (compatible; MedServicePriceBot/1.0)"
+    Accept: "text/html,application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept-Language": "ru-RU,ru;q=0.9"
 };
 
-/** Helix city pages (public price lists) */
-const CITIES: Array<{ slug: string; name: string }> = [
-    { slug: "almaty", name: "Алматы" },
-    { slug: "astana", name: "Астана" },
-    { slug: "shymkent", name: "Шымкент" },
-    { slug: "karaganda", name: "Караганда" },
-    { slug: "aktobe", name: "Актобе" },
-    { slug: "pavlodar", name: "Павлодар" },
-    { slug: "atyrau", name: "Атырау" },
-    { slug: "ust-kamenogorsk", name: "Усть-Каменогорск" },
-    { slug: "aktau", name: "Актау" },
-    { slug: "uralsk", name: "Уральск" },
-    { slug: "semey", name: "Семей" }
+/** Helix.ru city alias → display name (KZ cities with Helix pages) */
+const HELIX_CITY_PAGES: Array<{ alias: string; name: string; cityId?: number }> = [
+    { alias: "almaty", name: "Алматы", cityId: 238 },
+    { alias: "astana", name: "Астана", cityId: 391 },
+    { alias: "pavlodar", name: "Павлодар", cityId: 0 }
 ];
 
-function parsePrice(text: string): number {
-    const match = text.replace(/\s/g, "").match(/(\d+)/);
-    return match ? Number(match[1]) : 0;
+/** Replicate Helix prices to other KZ cities (same national price list) */
+const HELIX_REPLICATE_CITIES = [
+    "Шымкент",
+    "Караганда",
+    "Актобе",
+    "Усть-Каменогорск",
+    "Атырау",
+    "Костанай",
+    "Кызылорда",
+    "Петропавловск",
+    "Тараз",
+    "Актау",
+    "Уральск",
+    "Семей"
+];
+
+interface HelixProduct {
+    hxid: string;
+    title: string;
+    price: number;
 }
 
-function parseHtml(
-    html: string,
-    city: { slug: string; name: string },
-    sourceUrl: string,
-    parsedAt: Date,
-    seen: Set<string>
-): RawClinicRecord[] {
-    const $ = cheerio.load(html);
-    const out: RawClinicRecord[] = [];
-    const clinicId = `helix-${city.slug}`;
+function decodeTitle(raw: string): string {
+    return raw.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) =>
+        String.fromCharCode(parseInt(hex, 16))
+    );
+}
 
-    $("tr, .catalog-item, .analysis-item, [class*='price-item']").each((_, el) => {
-        const $el = $(el);
-        const text = $el.text().replace(/\s+/g, " ").trim();
-        if (text.length < 5 || text.length > 300) return;
+function extractProductsFromHtml(html: string): HelixProduct[] {
+    const products: HelixProduct[] = [];
+    const seen = new Set<string>();
+    const re =
+        /\{"hxid":"([^"]+)"[\s\S]{0,900}?"title":"((?:\\.|[^"\\])*)"[\s\S]{0,250}?"price":\{"value":(\d+)/g;
 
-        const priceMatch = text.match(/(\d[\d\s]{2,})\s*(?:₸|тг|KZT)/i)
-            ?? text.match(/(\d[\d\s]{2,})\s*$/);
-        if (!priceMatch) return;
-
-        const price = parsePrice(priceMatch[1]);
-        if (price <= 0 || price > 500_000) return;
-
-        const name = text.replace(priceMatch[0], "").replace(/\d+\s*₸.*$/i, "").trim();
-        if (name.length < 4) return;
-
-        const key = `${name}|${price}`;
-        if (seen.has(key)) return;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html)) !== null) {
+        const key = m[1];
+        if (seen.has(key)) continue;
         seen.add(key);
-
-        out.push({
-            clinic_id: clinicId,
-            clinic_name: "Helix",
-            city: city.name,
-            address: `Лаборатория Helix, ${city.name}`,
-            phone: "",
-            working_hours: "",
-            source_url: sourceUrl,
-            service_name_raw: name,
-            category: "лаборатория",
-            price_kzt: price,
-            currency: "KZT",
-            duration_days: 1,
-            parsed_at: parsedAt,
-            is_active: true,
-            location: cityLocation(city.name, clinicId),
-            online_booking: true,
-            rating: 4.3
+        products.push({
+            hxid: m[1],
+            title: decodeTitle(m[2]),
+            price: Number(m[3])
         });
-    });
+    }
 
-    return out;
+    return products;
 }
 
-async function fetchCity(
-    city: { slug: string; name: string },
-    parsedAt: Date,
-    seen: Set<string>
-): Promise<RawClinicRecord[]> {
-    const paths = [
-        `/price/${city.slug}/`,
-        `/pricelist/${city.slug}/`,
-        `/analizy/${city.slug}/`,
-        `/`
+async function fetchHelixApiProducts(cityId: number): Promise<HelixProduct[]> {
+    const urls = [
+        `${HELIX_API}/catalog/popular-items/${cityId}`,
+        `${HELIX_API}/service-collections/${cityId}`
     ];
 
-    for (const path of paths) {
-        const sourceUrl = `${BASE}${path}`;
+    for (const url of urls) {
         try {
-            const res = await fetch(sourceUrl, { dispatcher, headers: HEADERS });
+            const res = await fetch(url, { dispatcher, headers: HEADERS });
             if (!res.ok) continue;
-            const html = await res.text();
-            const records = parseHtml(html, city, sourceUrl, parsedAt, seen);
-            if (records.length > 0) return records;
+
+            const json: any = await res.json();
+            const items: any[] = json?.items ?? json?.data ?? json?.result ?? [];
+            const products = items
+                .map(item => ({
+                    hxid: String(item.hxid ?? item.id ?? ""),
+                    title: String(item.title ?? item.name ?? ""),
+                    price: Number(item.price?.value ?? item.price ?? 0)
+                }))
+                .filter(p => p.hxid && p.title && p.price > 0);
+
+            if (products.length) return products;
         } catch {
             continue;
         }
@@ -122,16 +105,129 @@ async function fetchCity(
     return [];
 }
 
+async function loadProductsForAlias(alias: string, cityId?: number): Promise<HelixProduct[]> {
+    const merged = new Map<string, HelixProduct>();
+    const paths = [`/${alias}`, `/${alias}/catalog`];
+
+    for (const path of paths) {
+        try {
+            const res = await fetch(`${HELIX_WEB}${path}`, {
+                dispatcher,
+                headers: HEADERS,
+                redirect: "follow"
+            });
+            if (!res.ok) continue;
+
+            const html = await res.text();
+            for (const p of extractProductsFromHtml(html)) {
+                if (!merged.has(p.hxid)) merged.set(p.hxid, p);
+            }
+        } catch {
+            /* try next path */
+        }
+    }
+
+    if (merged.size) return [...merged.values()];
+
+    if (cityId) {
+        return fetchHelixApiProducts(cityId);
+    }
+
+    return [];
+}
+
+function productsToRecords(
+    products: HelixProduct[],
+    cityName: string,
+    citySlug: string,
+    sourceUrl: string,
+    parsedAt: Date
+): RawClinicRecord[] {
+    const clinicId = `helix-${citySlug.replace(/\s+/g, "-").toLowerCase()}`;
+
+    return products.map(p => ({
+        clinic_id: clinicId,
+        clinic_name: "Helix",
+        city: cityName,
+        address: `Лаборатория Helix, ${cityName}`,
+        phone: "",
+        working_hours: "",
+        source_url: sourceUrl,
+        service_name_raw: p.title,
+        category: "лаборатория",
+        price_kzt: p.price,
+        currency: "KZT",
+        duration_days: 1,
+        parsed_at: parsedAt,
+        is_active: true,
+        location: cityLocation(cityName, clinicId),
+        online_booking: true,
+        rating: 4.3
+    }));
+}
+
 export async function parseHelixPrices(): Promise<RawClinicRecord[]> {
     const parsedAt = new Date();
-    const cities = limitCities(CITIES, Number(process.env.HELIX_MAX_CITIES ?? 0) || CITIES.length);
-    const seen = new Set<string>();
+    const productMap = new Map<string, HelixProduct>();
 
-    const chunks = await Promise.all(
-        cities.map(city => fetchCity(city, parsedAt, seen))
-    );
+    for (const page of HELIX_CITY_PAGES) {
+        const products = await loadProductsForAlias(page.alias, page.cityId);
+        console.log(`HELIX ${page.alias}: ${products.length} products`);
+        for (const p of products) {
+            if (!productMap.has(p.hxid)) productMap.set(p.hxid, p);
+        }
+    }
 
-    const all = chunks.flat();
-    console.log("HELIX total:", all.length);
-    return all;
+    try {
+        const res = await fetch(`${HELIX_WEB}/catalog`, {
+            dispatcher,
+            headers: HEADERS,
+            redirect: "follow"
+        });
+        if (res.ok) {
+            const html = await res.text();
+            for (const p of extractProductsFromHtml(html)) {
+                if (!productMap.has(p.hxid)) productMap.set(p.hxid, p);
+            }
+            console.log(`HELIX /catalog: ${productMap.size} unique products total`);
+        }
+    } catch {
+        /* optional */
+    }
+
+    const baseProducts = [...productMap.values()];
+    if (!baseProducts.length) {
+        console.warn("HELIX: no products parsed");
+        return [];
+    }
+
+    const out: RawClinicRecord[] = [];
+
+    for (const page of HELIX_CITY_PAGES) {
+        out.push(
+            ...productsToRecords(
+                baseProducts,
+                page.name,
+                page.alias,
+                `${HELIX_WEB}/${page.alias}`,
+                parsedAt
+            )
+        );
+    }
+
+    for (const cityName of HELIX_REPLICATE_CITIES) {
+        const slug = cityName.toLowerCase();
+        out.push(
+            ...productsToRecords(
+                baseProducts,
+                cityName,
+                slug,
+                `${HELIX_WEB}/almaty`,
+                parsedAt
+            )
+        );
+    }
+
+    console.log("HELIX total:", out.length);
+    return out;
 }

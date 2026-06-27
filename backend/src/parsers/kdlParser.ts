@@ -47,15 +47,47 @@ async function fetchPage(city: KdlCity, page: number): Promise<any[] | null> {
     }
 }
 
+async function loadCityMeta(city: KdlCity): Promise<{
+    phone: string;
+    location?: { lat: number; lng: number };
+}> {
+    try {
+        const res = await fetch(
+            `https://www.kdlolymp.kz/api/city/${city.slug}?lang=ru-RU`,
+            { dispatcher, headers: BASE_HEADERS }
+        );
+        if (!res.ok) return { phone: "" };
+
+        const json: any = await res.json();
+        const data = json?.data;
+        const phone =
+            data?.phones?.[0]?.phone_number ??
+            data?.phone_number ??
+            "";
+        const lat = Number(data?.latitude);
+        const lng = Number(data?.longitude);
+        const location =
+            Number.isFinite(lat) && Number.isFinite(lng)
+                ? { lat, lng }
+                : undefined;
+
+        return { phone, location };
+    } catch {
+        return { phone: "" };
+    }
+}
+
 function extractFromCategories(
     city: KdlCity,
     parsedAt: Date,
     pricelistUrl: string,
     categories: any[],
     seen: Set<string>,
-    out: RawClinicRecord[]
+    out: RawClinicRecord[],
+    meta: { phone: string; location?: { lat: number; lng: number } }
 ) {
     const clinicId = "kdl-" + city.slug;
+    const location = meta.location ?? cityLocation(city.title, clinicId);
 
     for (let i = 0; i < categories.length; i++) {
         const analysis = categories[i].analysis;
@@ -75,11 +107,11 @@ function extractFromCategories(
 
             out.push({
                 clinic_id: clinicId,
-                clinic_name: "KDL",
+                clinic_name: `KDL ОЛИМП — ${city.title}`,
                 city: city.title,
-                address: "",
-                phone: "",
-                working_hours: "",
+                address: `Лаборатория KDL, ${city.title}`,
+                phone: meta.phone,
+                working_hours: "Пн–Сб 07:00–21:00",
                 source_url: pricelistUrl,
                 service_name_raw: title,
                 category: "лаборатория",
@@ -88,7 +120,7 @@ function extractFromCategories(
                 duration_days: priceObj.min_duration ?? 1,
                 parsed_at: parsedAt,
                 is_active: true,
-                location: cityLocation(city.title, clinicId),
+                location,
                 online_booking: true,
                 rating: 4.4
             });
@@ -100,11 +132,12 @@ async function processCity(city: KdlCity, parsedAt: Date): Promise<RawClinicReco
     const out: RawClinicRecord[] = [];
     const seen = new Set<string>();
     const pricelistUrl = kdlPricelistUrl(city.slug);
+    const meta = await loadCityMeta(city);
 
     const categories1 = await fetchPage(city, 1);
     if (!categories1) return out;
 
-    extractFromCategories(city, parsedAt, pricelistUrl, categories1, seen, out);
+    extractFromCategories(city, parsedAt, pricelistUrl, categories1, seen, out, meta);
 
     const needsPage2 = categories1.some(
         c => Array.isArray(c.analysis) && c.analysis.length === 500
@@ -113,7 +146,7 @@ async function processCity(city: KdlCity, parsedAt: Date): Promise<RawClinicReco
     if (needsPage2) {
         const categories2 = await fetchPage(city, 2);
         if (categories2) {
-            extractFromCategories(city, parsedAt, pricelistUrl, categories2, seen, out);
+            extractFromCategories(city, parsedAt, pricelistUrl, categories2, seen, out, meta);
         }
     }
 

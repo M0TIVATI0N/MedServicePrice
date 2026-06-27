@@ -44,7 +44,7 @@ export const DOQ_MAX_CITIES = envInt("DOQ_MAX_CITIES", 0);
 export const HELIX_MAX_CITIES = envInt("HELIX_MAX_CITIES", 0);
 export const GEMOTEST_MAX_CITIES = envInt("GEMOTEST_MAX_CITIES", 0);
 /** Max paginated doctor-list requests per DOQ city (100 doctors each) */
-export const DOQ_MAX_DOCTOR_PAGES = envInt("DOQ_MAX_DOCTOR_PAGES", 8);
+export const DOQ_MAX_DOCTOR_PAGES = envInt("DOQ_MAX_DOCTOR_PAGES", 20);
 
 /** Invitro category IDs — small HTML pages (~15–50 tests each) */
 export const INVITRO_CATEGORY_IDS = (
@@ -54,7 +54,10 @@ export const INVITRO_CATEGORY_IDS = (
     .map(s => s.trim())
     .filter(Boolean);
 
-export const PARSER_MAX_RECORDS = envInt("PARSER_MAX_RECORDS", 200000);
+export const PARSER_MAX_RECORDS = envInt("PARSER_MAX_RECORDS", 250000);
+/** Cap each source separately so KDL doesn't crowd out DOQ / Invitro */
+export const PARSER_MAX_PER_SOURCE = envInt("PARSER_MAX_PER_SOURCE", 50000);
+export const PARSER_MAX_KDL = envInt("PARSER_MAX_KDL", 30000);
 export const PARSER_STORE_RAW = process.env.PARSER_STORE_RAW === "true";
 /** Only wipe DB when explicitly enabled — avoids empty DB after failed parse */
 export const PARSER_REPLACE_DB = process.env.PARSER_REPLACE_DB === "true";
