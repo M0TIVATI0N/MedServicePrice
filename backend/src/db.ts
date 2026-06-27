@@ -5,7 +5,8 @@ import {
     MapLocation,
     RawClinicRecord,
     ClinicServiceOffer,
-    PriceHistoryEntry
+    PriceHistoryEntry,
+    PriceSubscription
 } from "./models";
 
 dotenv.config();
@@ -209,4 +210,41 @@ export const PriceHistory = getModel<PriceHistoryDoc>(
     "PriceHistory",
     PriceHistorySchema,
     "price_history"
+);
+
+/* -------------------- PRICE SUBSCRIPTIONS -------------------- */
+
+export interface PriceSubscriptionDoc extends PriceSubscription, Document {}
+
+const PriceSubscriptionSchema = new Schema<PriceSubscriptionDoc>(
+    {
+        subscription_id: { type: String, required: true, unique: true, index: true },
+        user_email: { type: String, required: true, index: true },
+        clinic_id: { type: String, required: true, index: true },
+        clinic_name: String,
+        service_id: { type: String, required: true, index: true },
+        service_name: String,
+        target_price: Number,
+        current_price: { type: Number, required: true },
+        is_active: { type: Boolean, default: true, index: true },
+        created_at: { type: Date, default: Date.now, index: true },
+        last_notified_at: Date
+    },
+    {
+        ...schemaOptions,
+        collection: "price_subscriptions"
+    }
+);
+
+PriceSubscriptionSchema.index(
+    { clinic_id: 1, service_id: 1, user_email: 1 },
+    { unique: true }
+);
+
+PriceSubscriptionSchema.index({ user_email: 1, is_active: 1 });
+
+export const PriceSubscriptionModel = getModel<PriceSubscriptionDoc>(
+    "PriceSubscription",
+    PriceSubscriptionSchema,
+    "price_subscriptions"
 );

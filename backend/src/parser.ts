@@ -1,7 +1,8 @@
-import { RawRecord, OfferRecord, PriceHistory } from "./db";
+import { RawRecord, OfferRecord, PriceHistory, PriceSubscriptionModel } from "./db";
 import { fetchSourceRecords } from "./parsers";
 import { normalizeService } from "./normalizer";
 import { SortOrder } from "mongoose";
+import crypto from "crypto";
 
 /* -------------------- READ FUNCTIONS -------------------- */
 
@@ -55,10 +56,214 @@ export async function fetchPriceHistory(
         .lean();
 }
 
+/**
+ * Fetch detailed price history for a specific clinic and service
+ */
+export async function fetchClinicServicePriceHistory(
+    clinicId: string,
+    serviceId: string,
+    limit = 50
+) {
+    return PriceHistory.find({
+        clinic_id: clinicId,
+        service_id: serviceId
+    })
+        .sort({ parsed_at: -1 })
+        .limit(limit)
+        .lean();
+}
+
+/**
+ * Compare multiple clinics for the same service
+ */
+export async function compareClinics(
+    serviceId: string,
+    clinicIds?: string[]
+) {
+    const query: any = { service_id: serviceId };
+    
+    if (clinicIds && clinicIds.length > 0) {
+        query.clinic_id = { $in: clinicIds };
+    }
+
+    const offers = await OfferRecord.find(query)
+        .sort({ price_kzt: 1 })
+        .lean();
+
+    // Group by clinic and get latest offer per clinic
+    const clinicMap = new Map<string, any>();
+    
+    for (const offer of offers) {
+        if (!clinicMap.has(offer.clinic_id)) {
+            clinicMap.set(offer.clinic_id, {
+                clinic_id: offer.clinic_id,
+                clinic_name: offer.clinic_name,
+                city: offer.city,
+                address: offer.address,
+                phone: offer.phone,
+                service_name_norm: offer.service_name_norm,
+                price_kzt: offer.price_kzt,
+                parsed_at: offer.parsed_at,
+                location: offer.location
+            });
+        }
+    }
+
+    const comparisonData = Array.from(clinicMap.values())
+        .sort((a, b) => a.price_kzt - b.price_kzt);
+
+    // Calculate statistics
+    const prices = comparisonData.map(c => c.price_kzt);
+    const minPrice = Math.min(...prices);
+    const maxPrice = Math.max(...prices);
+    const avgPrice = prices.reduce((sum, p) => sum + p, 0) / prices.length;
+
+    return {
+        service_id: serviceId,
+        service_name: comparisonData[0]?.service_name_norm || '',
+        total_clinics: comparisonData.length,
+        price_range: {
+            min: minPrice,
+            max: maxPrice,
+            average: Math.round(avgPrice),
+            difference: maxPrice - minPrice
+        },
+        clinics: comparisonData.map(clinic => ({
+            ...clinic,
+            is_cheapest: clinic.price_kzt === minPrice,
+            is_most_expensive: clinic.price_kzt === maxPrice,
+            deviation_from_avg: Math.round(((clinic.price_kzt - avgPrice) / avgPrice) * 100) + '%'
+        }))
+    };
+}
+
 export async function fetchUnmatchedQueue() {
     return OfferRecord.find({
         service_id: /^unmatched-/
     }).lean();
+}
+
+/* -------------------- SUBSCRIPTION FUNCTIONS -------------------- */
+
+export async function createPriceSubscription(
+    userEmail: string,
+    clinicId: string,
+    clinicName: string,
+    serviceId: string,
+    serviceName: string,
+    targetPrice?: number
+): Promise<any> {
+    const subscriptionId = crypto
+        .createHash('sha256')
+        .update(`${userEmail}|${clinicId}|${serviceId}`)
+        .digest('hex');
+
+    // Get current price
+    const currentOffer = await OfferRecord.findOne({
+        clinic_id: clinicId,
+        service_id: serviceId
+    }).sort({ parsed_at: -1 });
+
+    if (!currentOffer) {
+        throw new Error('Service not found for this clinic');
+    }
+
+    const subscription = await PriceSubscriptionModel.findOneAndUpdate(
+        { subscription_id: subscriptionId },
+        {
+            $set: {
+                subscription_id: subscriptionId,
+                user_email: userEmail,
+                clinic_id: clinicId,
+                clinic_name: clinicName,
+                service_id: serviceId,
+                service_name: serviceName,
+                target_price: targetPrice,
+                current_price: currentOffer.price_kzt,
+                is_active: true,
+                created_at: new Date()
+            }
+        },
+        { upsert: true, new: true }
+    );
+
+    return subscription;
+}
+
+export async function getUserSubscriptions(userEmail: string) {
+    return PriceSubscriptionModel.find({
+        user_email: userEmail,
+        is_active: true
+    }).sort({ created_at: -1 }).lean();
+}
+
+export async function checkPriceChanges(): Promise<{ notifications: any[] }> {
+    const activeSubscriptions = await PriceSubscriptionModel.find({
+        is_active: true
+    });
+
+    const notifications: any[] = [];
+
+    for (const sub of activeSubscriptions) {
+        const currentOffer = await OfferRecord.findOne({
+            clinic_id: sub.clinic_id,
+            service_id: sub.service_id
+        }).sort({ parsed_at: -1 });
+
+        if (!currentOffer) continue;
+
+        const oldPrice = sub.current_price;
+        const newPrice = currentOffer.price_kzt;
+
+        if (oldPrice !== newPrice) {
+            // Check if target price is met
+            const shouldNotify = !sub.target_price || newPrice <= sub.target_price;
+
+            if (shouldNotify) {
+                notifications.push({
+                    subscription_id: sub.subscription_id,
+                    user_email: sub.user_email,
+                    clinic_name: sub.clinic_name,
+                    service_name: sub.service_name,
+                    old_price: oldPrice,
+                    new_price: newPrice,
+                    price_change: newPrice - oldPrice,
+                    percentage_change: ((newPrice - oldPrice) / oldPrice * 100).toFixed(2) + '%'
+                });
+
+                // Update subscription
+                await PriceSubscriptionModel.updateOne(
+                    { subscription_id: sub.subscription_id },
+                    {
+                        $set: {
+                            current_price: newPrice,
+                            last_notified_at: new Date()
+                        }
+                    }
+                );
+            } else {
+                // Just update current price without notification
+                await PriceSubscriptionModel.updateOne(
+                    { subscription_id: sub.subscription_id },
+                    {
+                        $set: {
+                            current_price: newPrice
+                        }
+                    }
+                );
+            }
+        }
+    }
+
+    return { notifications };
+}
+
+export async function cancelSubscription(subscriptionId: string): Promise<boolean> {
+    const result = await PriceSubscriptionModel.updateOne(
+        { subscription_id: subscriptionId },
+        { $set: { is_active: false } }
+    );
+    return result.modifiedCount > 0;
 }
 
 /* -------------------- CORE PARSER (OPTIMIZED) -------------------- */
