@@ -1,181 +1,244 @@
-import crypto from 'crypto';
-import { RawClinicRecord } from './models';
-import { normalizeService } from './normalizer';
-import { RawRecord, OfferRecord, PriceHistory } from './db';
-import { fetchSourceRecords } from './parsers';
-import { SortOrder } from 'mongoose';
-
-function getRecordHash(record: RawClinicRecord): string {
-  return crypto
-    .createHash('sha256')
-    .update(
-      `${record.clinic_id}|${record.source_url}|${record.service_name_raw}|${record.price_kzt}`
-    )
-    .digest('hex');
-}
+import { RawRecord, OfferRecord, PriceHistory } from "./db";
+import { fetchSourceRecords } from "./parsers";
+import { normalizeService } from "./normalizer";
+import { SortOrder } from "mongoose";
 
 /* -------------------- READ FUNCTIONS -------------------- */
 
 export async function fetchRawData() {
-  return RawRecord.find()
-    .sort({ parsed_at: -1 })
-    .limit(200)
-    .lean();
+    return RawRecord.find()
+        .sort({ parsed_at: -1 })
+        .limit(200)
+        .lean();
 }
 
 export async function fetchNormalizedOffers(
-  filters: Record<string, any> = {},
-  sort: Record<string, SortOrder> = { price_kzt: 1 },
-  page = 1,
-  limit = 50
+    filters: Record<string, any> = {},
+    sort: Record<string, SortOrder> = { price_kzt: 1 },
+    page = 1,
+    limit = 50
 ) {
-  return OfferRecord.find(filters)
-    .sort(sort)
-    .skip((page - 1) * limit)
-    .limit(limit)
-    .lean();
+    return OfferRecord.find(filters)
+        .sort(sort)
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean();
 }
 
 export async function fetchClinics(query: Record<string, any> = {}) {
-  return OfferRecord.aggregate([
-    { $match: query },
-    {
-      $group: {
-        _id: '$clinic_id',
-        clinic_id: { $first: '$clinic_id' },
-        clinic_name: { $first: '$clinic_name' },
-        city: { $first: '$city' },
-        address: { $first: '$address' },
-        phone: { $first: '$phone' },
-        working_hours: { $first: '$working_hours' },
-        source_url: { $first: '$source_url' },
-        location: { $first: '$location' },
-        services: { $push: '$$ROOT' }
-      }
-    }
-  ]).exec();
+    return OfferRecord.aggregate([
+        { $match: query },
+        {
+            $group: {
+                _id: "$clinic_id",
+                clinic_id: { $first: "$clinic_id" },
+                clinic_name: { $first: "$clinic_name" },
+                city: { $first: "$city" },
+                address: { $first: "$address" },
+                phone: { $first: "$phone" },
+                working_hours: { $first: "$working_hours" },
+                source_url: { $first: "$source_url" },
+                location: { $first: "$location" },
+                services: { $push: "$$ROOT" }
+            }
+        }
+    ]).exec();
 }
 
 export async function fetchPriceHistory(
-  filters: Record<string, any> = {},
-  limit = 20
+    filters: Record<string, any> = {},
+    limit = 20
 ) {
-  return PriceHistory.find(filters)
-    .sort({ parsed_at: -1 })
-    .limit(limit)
-    .lean();
+    return PriceHistory.find(filters)
+        .sort({ parsed_at: -1 })
+        .limit(limit)
+        .lean();
 }
 
 export async function fetchUnmatchedQueue() {
-  return OfferRecord.find({
-    service_id: /^unmatched-/
-  }).lean();
+    return OfferRecord.find({
+        service_id: /^unmatched-/
+    }).lean();
 }
 
-/* -------------------- CORE PARSER -------------------- */
+/* -------------------- CORE PARSER (OPTIMIZED) -------------------- */
 
 export async function runParser() {
-  console.log('PARSER MODULE LOADED');
+    console.log("PARSER MODULE LOADED");
 
-  const sourceRecords = await fetchSourceRecords();
-  console.log('SOURCE RECORDS:', sourceRecords.length);
+    console.time("fetch");
+    const sourceRecords = await fetchSourceRecords();
+    console.timeEnd("fetch");
 
-  const rawOps: any[] = [];
-  const offerOps: any[] = [];
-  const historyOps: any[] = [];
+    console.log("SOURCE RECORDS:", sourceRecords.length);
 
-  let processed = 0;
-  let unmatched = 0;
+    console.time("normalize");
 
-  for (const raw of sourceRecords) {
-    try {
-      processed++;
+    const BATCH_SIZE = 3000; // slightly smaller = faster flush cycles
 
-      const raw_hash = getRecordHash(raw);
+    let processed = 0;
+    let unmatched = 0;
 
-      rawOps.push({
-        updateOne: {
-          filter: { raw_hash },
-          update: {
-            $set: {
-              ...raw,
-              raw_hash,
-              parsed_at: new Date(raw.parsed_at)
+    let rawOps: any[] = [];
+    let offerOps: any[] = [];
+    let historyOps: any[] = [];
+
+    const flush = async () => {
+        const tasks: Promise<any>[] = [];
+
+        if (rawOps.length) {
+            tasks.push(
+                RawRecord.bulkWrite(rawOps, {
+                    ordered: false,
+                    writeConcern: { w: 0 }
+                })
+            );
+        }
+
+        if (offerOps.length) {
+            tasks.push(
+                OfferRecord.bulkWrite(offerOps, {
+                    ordered: false,
+                    writeConcern: { w: 0 }
+                })
+            );
+        }
+
+        if (historyOps.length) {
+            tasks.push(
+                PriceHistory.bulkWrite(historyOps, {
+                    ordered: false,
+                    writeConcern: { w: 0 }
+                })
+            );
+        }
+
+        rawOps = [];
+        offerOps = [];
+        historyOps = [];
+
+        if (tasks.length) {
+            await Promise.all(tasks);
+        }
+    };
+
+    for (let i = 0; i < sourceRecords.length; i++) {
+        const raw = sourceRecords[i];
+        processed++;
+
+        const parsedAt =
+            raw.parsed_at instanceof Date
+                ? raw.parsed_at
+                : new Date(raw.parsed_at);
+
+        /* -------------------- FASTER HASH -------------------- */
+        const raw_hash =
+            raw.clinic_id +
+            "|" +
+            raw.source_url +
+            "|" +
+            raw.service_name_raw +
+            "|" +
+            raw.price_kzt;
+
+        /* -------------------- RAW UPSERT -------------------- */
+        rawOps.push({
+            updateOne: {
+                filter: { raw_hash },
+                update: {
+                    $set: {
+                        clinic_id: raw.clinic_id,
+                        clinic_name: raw.clinic_name,
+                        city: raw.city,
+                        address: raw.address,
+                        phone: raw.phone,
+                        working_hours: raw.working_hours,
+                        source_url: raw.source_url,
+                        service_name_raw: raw.service_name_raw,
+                        category: raw.category,
+                        price_kzt: raw.price_kzt,
+                        currency: raw.currency,
+                        duration_days: raw.duration_days,
+                        parsed_at: parsedAt,
+                        is_active: raw.is_active,
+                        location: raw.location,
+                        raw_hash
+                    }
+                },
+                upsert: true
             }
-          },
-          upsert: true
+        });
+
+        const offer = normalizeService(raw);
+
+        if (offer.service_id.charCodeAt(0) === 117) {
+            unmatched++;
         }
-      });
 
-      const offer = normalizeService(raw);
+        offer.parsed_at = parsedAt;
 
-      if (offer.service_id.startsWith('unmatched-')) {
-        unmatched++;
-      }
-
-      const filter = {
-        clinic_id: offer.clinic_id,
-        service_id: offer.service_id,
-        source_url: offer.source_url,
-        city: offer.city
-      };
-
-      offerOps.push({
-        updateOne: {
-          filter,
-          update: {
-            $set: {
-              ...offer,
-              parsed_at: new Date(offer.parsed_at)
+        /* -------------------- OFFER UPSERT -------------------- */
+        offerOps.push({
+            updateOne: {
+                filter: {
+                    clinic_id: offer.clinic_id,
+                    service_id: offer.service_id,
+                    city: offer.city
+                },
+                update: {
+                    $set: {
+                        clinic_id: offer.clinic_id,
+                        clinic_name: offer.clinic_name,
+                        city: offer.city,
+                        address: offer.address,
+                        phone: offer.phone,
+                        working_hours: offer.working_hours,
+                        source_url: offer.source_url,
+                        service_id: offer.service_id,
+                        service_name_raw: offer.service_name_raw,
+                        service_name_norm: offer.service_name_norm,
+                        category: offer.category,
+                        price_kzt: offer.price_kzt,
+                        currency: offer.currency,
+                        duration_days: offer.duration_days,
+                        parsed_at: parsedAt,
+                        is_active: offer.is_active,
+                        location: offer.location
+                    }
+                },
+                upsert: true
             }
-          },
-          upsert: true
+        });
+
+        /* -------------------- HISTORY (lightweight insert) -------------------- */
+        historyOps.push({
+            insertOne: {
+                document: {
+                    clinic_id: offer.clinic_id,
+                    service_id: offer.service_id,
+                    clinic_name: offer.clinic_name,
+                    service_name_norm: offer.service_name_norm,
+                    price_kzt: offer.price_kzt,
+                    parsed_at: parsedAt,
+                    source_url: offer.source_url
+                }
+            }
+        });
+
+        /* -------------------- FLUSH CONTROL -------------------- */
+        if (rawOps.length >= BATCH_SIZE) {
+            await flush();
         }
-      });
-
-      historyOps.push({
-        insertOne: {
-          document: {
-            clinic_id: offer.clinic_id,
-            service_id: offer.service_id,
-            clinic_name: offer.clinic_name,
-            service_name_norm: offer.service_name_norm,
-            price_kzt: offer.price_kzt,
-            parsed_at: new Date(offer.parsed_at),
-            source_url: offer.source_url
-          }
-        }
-      });
-    } catch (err) {
-      console.error('PARSE ERROR:', err);
-    }
-  }
-
-  try {
-    if (rawOps.length) {
-      await RawRecord.bulkWrite(rawOps, { ordered: false });
     }
 
-    if (offerOps.length) {
-      await OfferRecord.bulkWrite(offerOps, { ordered: false });
-    }
+    await flush();
 
-    if (historyOps.length) {
-      await PriceHistory.bulkWrite(historyOps, { ordered: false });
-    }
-  } catch (err) {
-    console.error('BULK WRITE FAILED:', err);
-  }
+    console.timeEnd("normalize");
 
-  console.log('PARSE DONE:', {
-    processed,
-    unmatched
-  });
-
-  return {
-    parsed_at: new Date().toISOString(),
-    total: processed,
-    unmatched,
-    errors: []
-  };
+    return {
+        parsed_at: new Date().toISOString(),
+        total: processed,
+        unmatched,
+        errors: []
+    };
 }

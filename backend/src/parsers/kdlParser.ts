@@ -1,3 +1,4 @@
+import { Agent, fetch } from "undici";
 import { RawClinicRecord } from "../models";
 
 interface City {
@@ -6,136 +7,188 @@ interface City {
     title: string;
 }
 
-const CONCURRENCY = 5;
-const MAX_PAGES = 30;
-
 const BASE_URL =
     "https://www.kdlolymp.kz/api/analysis-data";
 
-async function fetchJson(url: string, city: City): Promise<any | null> {
+const CONCURRENCY = 40;
+
+const dispatcher = new Agent({
+    connections: 120,
+    pipelining: 8,
+    keepAliveTimeout: 120000,
+    keepAliveMaxTimeout: 120000
+});
+
+const BASE_HEADERS = Object.freeze({
+    Accept: "application/json",
+    "User-Agent": "Mozilla/5.0"
+});
+
+async function fetchPage(
+    city: City,
+    page: number,
+    headers: Record<string, string>
+): Promise<{ url: string; json: any } | null> {
+    const url =
+        BASE_URL +
+        "?lang=ru-RU&city_id=" +
+        city.id +
+        "&city_slug=" +
+        city.slug +
+        "&search=&per-page=100&page=" +
+        page;
+
     try {
         const res = await fetch(url, {
-            headers: {
-                Accept: "application/json",
-                "User-Agent": "Mozilla/5.0",
-                Referer: `https://www.kdlolymp.kz/pricelist/${city.slug}`,
-                Cookie: `accepted-city=${city.id}; currentCity=${city.id}`
-            }
+            dispatcher,
+            headers
         });
 
-        if (!res.ok) {
-            console.log(city.title, res.status);
-            return null;
-        }
+        if (!res.ok) return null;
 
-        return await res.json();
-    } catch (e) {
-        console.error(city.title, e);
+        return {
+            url,
+            json: await res.json()
+        };
+    } catch {
         return null;
+    }
+}
+
+function extractInto(
+    city: City,
+    parsedAt: Date,
+    url: string,
+    categories: any[],
+    out: RawClinicRecord[],
+    seen?: Set<string>
+) {
+    const clinicId = "kdl-" + city.slug;
+    const cityTitle = city.title;
+
+    for (let i = 0; i < categories.length; i++) {
+        const analysis = categories[i].analysis;
+
+        if (!Array.isArray(analysis)) continue;
+
+        for (let j = 0; j < analysis.length; j++) {
+            const item = analysis[j];
+
+            const priceObj = item.price;
+
+            if (!priceObj) continue;
+
+            const price = priceObj.price;
+
+            if (price == null) continue;
+
+            const title =
+                item.translation?.title ||
+                item.name ||
+                item.slug ||
+                "";
+
+            if (seen) {
+                const key = title + "|" + price;
+
+                if (seen.has(key)) continue;
+
+                seen.add(key);
+            }
+
+            out.push({
+                clinic_id: clinicId,
+                clinic_name: "KDL",
+                city: cityTitle,
+                address: "",
+                phone: "",
+                working_hours: "",
+                source_url: url,
+                service_name_raw: title,
+                category: "лаборатория",
+                price_kzt: price,
+                currency: "KZT",
+                duration_days: priceObj.min_duration ?? 1,
+                parsed_at: parsedAt,
+                is_active: true
+            });
+        }
     }
 }
 
 async function processCity(
     city: City,
-    emit: (r: RawClinicRecord) => void
+    parsedAt: Date,
+    results: RawClinicRecord[]
 ) {
-    console.log("START", city.title);
+    const headers = {
+        ...BASE_HEADERS,
+        Referer:
+            "https://www.kdlolymp.kz/pricelist/" +
+            city.slug,
+        Cookie:
+            "accepted-city=" +
+            city.id +
+            "; currentCity=" +
+            city.id
+    };
 
-    const parsedAt = new Date().toISOString();
+    const first = await fetchPage(city, 1, headers);
 
-    const seen = new Set<string>();
+    if (!first) return;
 
-    for (let page = 1; page <= MAX_PAGES; page++) {
-        const url =
-            `${BASE_URL}?lang=ru-RU` +
-            `&city_id=${city.id}` +
-            `&city_slug=${city.slug}` +
-            `&search=` +
-            `&per-page=100` +
-            `&page=${page}`;
+    const categories = first.json.data;
 
-        const json = await fetchJson(url, city);
+    if (!Array.isArray(categories)) return;
 
-        if (!json)
-            break;
+    const before = results.length;
 
-        const categories = json.data;
+    extractInto(
+        city,
+        parsedAt,
+        first.url,
+        categories,
+        results
+    );
 
-        if (!Array.isArray(categories))
-            break;
+    let secondNeeded = false;
 
-        let added = 0;
+    for (let i = 0; i < categories.length; i++) {
+        const analysis = categories[i].analysis;
 
-        for (const category of categories) {
-            const analysis = category.analysis;
-
-            if (!Array.isArray(analysis))
-                continue;
-
-            for (const item of analysis) {
-                const title =
-                    item.translation?.title ??
-                    item.name ??
-                    item.slug;
-
-                const price = item.price?.price;
-
-                if (!title || !price)
-                    continue;
-
-                const key = title + "|" + price;
-
-                if (seen.has(key))
-                    continue;
-
-                seen.add(key);
-
-                emit({
-                    clinic_id: `kdl-${city.slug}`,
-                    clinic_name: "KDL",
-                    city: city.title,
-                    address: "",
-                    phone: "",
-                    working_hours: "",
-                    source_url: url,
-                    service_name_raw: title,
-                    category: "лаборатория",
-                    price_kzt: Number(price),
-                    currency: "KZT",
-                    duration_days:
-                        item.price?.min_duration ?? 1,
-                    parsed_at: parsedAt,
-                    is_active: true
-                });
-
-                added++;
-            }
-        }
-
-        console.log(
-            city.title,
-            "page",
-            page,
-            "added",
-            added
-        );
-
-        if (added === 0)
-            break;
-
-        //
-        // If API ignored page parameter,
-        // next page will contain exactly the same services.
-        //
-        if (page > 1 && added === seen.size) {
+        if (
+            Array.isArray(analysis) &&
+            analysis.length === 100
+        ) {
+            secondNeeded = true;
             break;
         }
     }
 
-    console.log(
-        "DONE",
-        city.title,
-        seen.size
+    if (!secondNeeded) return;
+
+    const second = await fetchPage(city, 2, headers);
+
+    if (!second) return;
+
+    const secondCategories = second.json.data;
+
+    if (!Array.isArray(secondCategories)) return;
+
+    const seen = new Set<string>();
+
+    for (let i = before; i < results.length; i++) {
+        const r = results[i];
+        seen.add(r.service_name_raw + "|" + r.price_kzt);
+    }
+
+    extractInto(
+        city,
+        parsedAt,
+        second.url,
+        secondCategories,
+        results,
+        seen
     );
 }
 
@@ -143,24 +196,30 @@ export async function parseKdlPrices(): Promise<RawClinicRecord[]> {
     const res = await fetch(
         "https://www.kdlolymp.kz/api/area?cities=true&lang=ru-RU",
         {
-            headers: {
-                Accept: "application/json",
-                "User-Agent": "Mozilla/5.0"
-            }
+            dispatcher,
+            headers: BASE_HEADERS
         }
     );
 
-    if (!res.ok)
+    if (!res.ok) {
         throw new Error("Cannot load cities");
+    }
 
-    const json = await res.json();
+    const json: any = await res.json();
 
     const cities: City[] = [];
 
-    for (const area of json.data ?? []) {
-        for (const city of area.cities ?? []) {
-            if (!city.is_active)
-                continue;
+    const areas = json.data ?? [];
+
+    for (let i = 0; i < areas.length; i++) {
+        const areaCities = areas[i].cities;
+
+        if (!Array.isArray(areaCities)) continue;
+
+        for (let j = 0; j < areaCities.length; j++) {
+            const city = areaCities[j];
+
+            if (!city.is_active) continue;
 
             cities.push({
                 id: city.id,
@@ -174,49 +233,37 @@ export async function parseKdlPrices(): Promise<RawClinicRecord[]> {
 
     console.log("Loaded", cities.length, "cities");
 
+    const parsedAt = new Date();
+
     const results: RawClinicRecord[] = [];
 
     let next = 0;
 
     async function worker() {
-        console.log("Worker started");
         while (true) {
-            const i = next++;
-console.log("City index", i);
+            const index = next++;
 
-
-            if (i >= cities.length)
-                return;
+            if (index >= cities.length) return;
 
             try {
                 await processCity(
-                    cities[i],
-                    r => results.push(r)
+                    cities[index],
+                    parsedAt,
+                    results
                 );
-            } catch (e) {
-                console.error(
-                    cities[i].title,
-                    e
-                );
-            }
+            } catch {}
         }
     }
-console.log("Loaded", cities.length, "cities");
 
-console.log("Before workers");
-    await Promise.all(
-        Array.from(
-            { length: CONCURRENCY },
-            worker
-        )
-    );
-console.log("After workers");
+    const workers = new Array(CONCURRENCY);
 
-    console.log(
-        "Collected",
-        results.length,
-        "offers"
-    );
+    for (let i = 0; i < CONCURRENCY; i++) {
+        workers[i] = worker();
+    }
+
+    await Promise.all(workers);
+
+    console.log("Collected", results.length, "offers");
 
     return results;
 }

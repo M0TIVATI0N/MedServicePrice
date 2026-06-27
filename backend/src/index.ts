@@ -36,7 +36,6 @@ async function startParser() {
         const result = await runParser();
 
         console.log("BOOT PARSER DONE:");
-        console.dir(result, { depth: null });
     } catch (err) {
         console.error("BOOT PARSER ERROR:", err);
     } finally {
