@@ -1,29 +1,30 @@
-import dotenv from 'dotenv';
-import express from 'express';
-import cors from 'cors';
-import routes from './routes';
-import { connectDB } from './db';
+    import dotenv from 'dotenv';
+    import express from 'express';
+    import cors from 'cors';
+    import routes from './routes';
+    import { connectDB } from './db';
+    import { runParser } from "./parser";
+    dotenv.config();
 
-dotenv.config();
+    const app = express();
+    const port = Number(process.env.PORT || 4000);
 
-const app = express();
-const port = Number(process.env.PORT || 4000);
+    app.use(cors({ origin: ['http://localhost:5173'] }));
+    app.use(express.json());
+    app.use('/api', routes);
 
-app.use(cors({ origin: ['http://localhost:5173'] }));
-app.use(express.json());
-app.use('/api', routes);
-import { runParser } from "./parser";
+    connectDB()
+    .then(async () => {
+        app.listen(port, async () => {
+        console.log(`Backend started: http://localhost:${port}`);
 
-runParser()
-    .then(console.log)
-    .catch(console.error);
-connectDB()
-  .then(() => {
-    app.listen(port, () => {
-      console.log(`Backend started: http://localhost:${port}`);
+        console.log("STARTING PARSER ON BOOT...");
+        runParser()
+            .then((r) => console.log("BOOT PARSER DONE:", r))
+            .catch((e) => console.error("BOOT PARSER ERROR:", e));
+        });
+    })
+    .catch((error) => {
+        console.error('Failed to connect to MongoDB:', error);
+        process.exit(1);
     });
-  })
-  .catch((error) => {
-    console.error('Failed to connect to MongoDB:', error);
-    process.exit(1);
-  });

@@ -1,68 +1,39 @@
 import crypto from 'crypto';
-import { RawClinicRecord, ClinicServiceOffer } from './models';
-import { normalizeService, getUnmatchedQueue } from './normalizer';
+import { RawClinicRecord } from './models';
+import { normalizeService } from './normalizer';
 import { RawRecord, OfferRecord, PriceHistory } from './db';
 import { fetchSourceRecords } from './parsers';
+import { SortOrder } from 'mongoose';
 
 function getRecordHash(record: RawClinicRecord): string {
   return crypto
     .createHash('sha256')
-    .update(`${record.clinic_id}|${record.source_url}|${record.service_name_raw}|${record.price_kzt}`)
+    .update(
+      `${record.clinic_id}|${record.source_url}|${record.service_name_raw}|${record.price_kzt}`
+    )
     .digest('hex');
 }
 
-async function saveRawRecord(raw: RawClinicRecord) {
-  const raw_hash = getRecordHash(raw);
-  await RawRecord.findOneAndUpdate(
-    { raw_hash },
-    { ...raw, raw_hash, parsed_at: new Date(raw.parsed_at) },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
-  );
-}
-
-async function saveOffer(offer: ClinicServiceOffer) {
-  const filter = {
-    clinic_id: offer.clinic_id,
-    service_id: offer.service_id,
-    source_url: offer.source_url
-  };
-  const existing = await OfferRecord.findOne(filter).lean<ClinicServiceOffer>().exec();
-  const offerData = { ...offer, parsed_at: new Date(offer.parsed_at) };
-
-  if (!existing) {
-    await OfferRecord.create(offerData);
-    await PriceHistory.create({
-      clinic_id: offer.clinic_id,
-      service_id: offer.service_id,
-      clinic_name: offer.clinic_name,
-      service_name_norm: offer.service_name_norm,
-      price_kzt: offer.price_kzt,
-      parsed_at: new Date(offer.parsed_at),
-      source_url: offer.source_url
-    });
-    return;
-  }
-
-  if (existing.price_kzt !== offer.price_kzt || existing.is_active !== offer.is_active || existing.service_name_raw !== offer.service_name_raw) {
-    await OfferRecord.findOneAndUpdate(filter, offerData, { new: true });
-    await PriceHistory.create({
-      clinic_id: offer.clinic_id,
-      service_id: offer.service_id,
-      clinic_name: offer.clinic_name,
-      service_name_norm: offer.service_name_norm,
-      price_kzt: offer.price_kzt,
-      parsed_at: new Date(offer.parsed_at),
-      source_url: offer.source_url
-    });
-  }
-}
+/* -------------------- READ FUNCTIONS -------------------- */
 
 export async function fetchRawData() {
-  return RawRecord.find().sort({ parsed_at: -1 }).limit(200).lean();
+  return RawRecord.find()
+    .sort({ parsed_at: -1 })
+    .limit(200)
+    .lean();
 }
 
-export async function fetchNormalizedOffers(query: Record<string, any> = {}): Promise<ClinicServiceOffer[]> {
-  return OfferRecord.find(query).sort({ price_kzt: 1 }).lean<ClinicServiceOffer[]>();
+export async function fetchNormalizedOffers(
+  filters: Record<string, any> = {},
+  sort: Record<string, SortOrder> = { price_kzt: 1 },
+  page = 1,
+  limit = 50
+) {
+  return OfferRecord.find(filters)
+    .sort(sort)
+    .skip((page - 1) * limit)
+    .limit(limit)
+    .lean();
 }
 
 export async function fetchClinics(query: Record<string, any> = {}) {
@@ -85,38 +56,126 @@ export async function fetchClinics(query: Record<string, any> = {}) {
   ]).exec();
 }
 
-export async function fetchPriceHistory(filters: Record<string, any> = {}, limit = 20) {
-  return PriceHistory.find(filters).sort({ parsed_at: -1 }).limit(limit).lean();
+export async function fetchPriceHistory(
+  filters: Record<string, any> = {},
+  limit = 20
+) {
+  return PriceHistory.find(filters)
+    .sort({ parsed_at: -1 })
+    .limit(limit)
+    .lean();
 }
 
 export async function fetchUnmatchedQueue() {
-  return OfferRecord.find({ service_id: /^unmatched-/ }).lean();
+  return OfferRecord.find({
+    service_id: /^unmatched-/
+  }).lean();
 }
+
+/* -------------------- CORE PARSER -------------------- */
 
 export async function runParser() {
+  console.log('PARSER MODULE LOADED');
+
   const sourceRecords = await fetchSourceRecords();
-  console.log("SOURCE RECORDS:", sourceRecords.length);
+  console.log('SOURCE RECORDS:', sourceRecords.length);
 
-console.log(sourceRecords.slice(0,5));
-  const errors: string[] = [];
+  const rawOps: any[] = [];
+  const offerOps: any[] = [];
+  const historyOps: any[] = [];
 
-for (const raw of sourceRecords) {
-    console.log("Processing:", raw.service_name_raw);
+  let processed = 0;
+  let unmatched = 0;
 
+  for (const raw of sourceRecords) {
     try {
-        await saveRawRecord(raw);
-        console.log("Saved raw");
+      processed++;
 
-        const offer = normalizeService(raw);
-        console.log("Normalized:", offer.service_name_norm);
+      const raw_hash = getRecordHash(raw);
 
-        await saveOffer(offer);
-        console.log("Saved offer");
+      rawOps.push({
+        updateOne: {
+          filter: { raw_hash },
+          update: {
+            $set: {
+              ...raw,
+              raw_hash,
+              parsed_at: new Date(raw.parsed_at)
+            }
+          },
+          upsert: true
+        }
+      });
+
+      const offer = normalizeService(raw);
+
+      if (offer.service_id.startsWith('unmatched-')) {
+        unmatched++;
+      }
+
+      const filter = {
+        clinic_id: offer.clinic_id,
+        service_id: offer.service_id,
+        source_url: offer.source_url,
+        city: offer.city
+      };
+
+      offerOps.push({
+        updateOne: {
+          filter,
+          update: {
+            $set: {
+              ...offer,
+              parsed_at: new Date(offer.parsed_at)
+            }
+          },
+          upsert: true
+        }
+      });
+
+      historyOps.push({
+        insertOne: {
+          document: {
+            clinic_id: offer.clinic_id,
+            service_id: offer.service_id,
+            clinic_name: offer.clinic_name,
+            service_name_norm: offer.service_name_norm,
+            price_kzt: offer.price_kzt,
+            parsed_at: new Date(offer.parsed_at),
+            source_url: offer.source_url
+          }
+        }
+      });
     } catch (err) {
-        console.error(err);
+      console.error('PARSE ERROR:', err);
     }
-}
+  }
 
-  const unmatched = await fetchUnmatchedQueue();
-  return { parsed_at: new Date().toISOString(), total: sourceRecords.length, unmatched: unmatched.length, errors };
+  try {
+    if (rawOps.length) {
+      await RawRecord.bulkWrite(rawOps, { ordered: false });
+    }
+
+    if (offerOps.length) {
+      await OfferRecord.bulkWrite(offerOps, { ordered: false });
+    }
+
+    if (historyOps.length) {
+      await PriceHistory.bulkWrite(historyOps, { ordered: false });
+    }
+  } catch (err) {
+    console.error('BULK WRITE FAILED:', err);
+  }
+
+  console.log('PARSE DONE:', {
+    processed,
+    unmatched
+  });
+
+  return {
+    parsed_at: new Date().toISOString(),
+    total: processed,
+    unmatched,
+    errors: []
+  };
 }

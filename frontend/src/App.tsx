@@ -39,9 +39,6 @@ interface PriceHistoryItem {
   parsed_at: string;
 }
 
-const cities = ['Алматы', 'Астана', 'Шымкент'];
-const categories = ['лаборатория', 'приём врача', 'диагностика', 'процедура'];
-
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({
   iconUrl,
@@ -63,10 +60,24 @@ function App() {
   const [showMap, setShowMap] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+    const [cities, setCities] = useState<string[]>([]);
+    const [categories, setCategories] = useState<string[]>([]);
+
 
   const apiBase = import.meta.env.VITE_API_BASE_URL || '/api';
   const mapsUrl = import.meta.env.VITE_GOOGLE_MAPS_URL || 'https://www.google.com/maps/dir/?api=1';
 
+    useEffect(() => {
+    fetch(`${apiBase}/cities`)
+        .then(r => r.json())
+        .then(setCities)
+        .catch(() => setCities([]));
+
+    fetch(`${apiBase}/categories`)
+        .then(r => r.json())
+        .then(setCategories)
+        .catch(() => setCategories([]));
+    }, [apiBase]);
   const searchParams = useMemo(() => {
     const params = new URLSearchParams();
     if (query.trim()) params.set('query', query.trim());
@@ -81,7 +92,11 @@ function App() {
   useEffect(() => {
     setLoading(true);
     setError(null);
-    fetch(`${apiBase}/services?${searchParams}`)
+    const PAGE_SIZE = 50;
+
+    fetch(
+    `${apiBase}/services?${searchParams}&page=1&limit=${PAGE_SIZE}`
+    )
       .then((res) => res.json())
       .then((data) => setOffers(data.data ?? []))
       .catch(() => setError('Не удалось загрузить данные.'))

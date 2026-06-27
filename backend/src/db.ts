@@ -6,7 +6,6 @@ dotenv.config();
 const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/medserviceprice';
 
 export async function connectDB() {
-    console.log(process.cwd());
   return mongoose.connect(mongoUri, { autoIndex: true });
 }
 
