@@ -35,6 +35,8 @@ export interface RawClinicRecord {
 
     location?: MapLocation;
     raw_hash?: string;
+    rating?: number;
+    online_booking?: boolean;
 }
 
 export interface NormalizedService {
@@ -56,9 +58,17 @@ export interface PriceHistoryEntry {
     service_name_norm: string;
 
     price_kzt: number;
+    previous_price_kzt?: number;
 
     // Store as a real Date in MongoDB
     parsed_at: Date;
 
     source_url: string;
+}
+
+export interface ParseLogEntry {
+    source: string;
+    level: "error" | "info" | "warn";
+    message: string;
+    parsed_at: Date;
 }

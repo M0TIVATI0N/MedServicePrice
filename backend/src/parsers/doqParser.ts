@@ -1,100 +1,283 @@
-import pLimit from "p-limit";
+import { Agent, fetch } from "undici";
+
 import { RawClinicRecord } from "../models";
+import { normalizeLocation } from "../geocoding";
 
-const CITY_CONCURRENCY = 5;
-const CLINIC_CONCURRENCY = 10;
-const DOCTOR_CONCURRENCY = 20;
+import { DOQ_MAX_CITIES, DOQ_MAX_DOCTOR_PAGES, limitCities } from "./config";
 
-const cityLimit = pLimit(CITY_CONCURRENCY);
-const clinicLimit = pLimit(CLINIC_CONCURRENCY);
-const doctorLimit = pLimit(DOCTOR_CONCURRENCY);
-
-async function safeFetchJson<T>(url: string): Promise<T | null> {
-    try {
-        const res = await fetch(url, {
-            headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" }
-        });
-        if (!res.ok) return null;
-        return (await res.json()) as T;
-    } catch {
-        return null;
-    }
+interface DoqCity {
+    id: number;
+    slug: string;
+    name: string;
 }
+
+
+
+const PAGE_SIZE = 100;
+
+
+
+const dispatcher = new Agent({
+
+    connections: 50,
+
+    pipelining: 1,
+
+    keepAliveTimeout: 30000,
+
+    bodyTimeout: 15000,
+
+    headersTimeout: 10000
+
+});
+
+
+
+const HEADERS = {
+
+    Accept: "application/json",
+
+    "User-Agent": "Mozilla/5.0"
+
+};
+
+
+
+async function getJson<T>(url: string): Promise<T | null> {
+
+    const res = await fetch(url, { dispatcher, headers: HEADERS });
+
+    if (!res.ok) return null;
+
+    return (await res.json()) as T;
+
+}
+
+
+
+async function fetchAllDoctors(cityId: number): Promise<any[]> {
+    const base =
+        `https://api.doq.kz/api/v1/doctors/?city=${cityId}` +
+        `&limit=${PAGE_SIZE}&expand=services,clinic_branches`;
+
+    const first = await getJson<any>(`${base}&offset=0`);
+    if (!first?.results) return [];
+
+    const total: number = first.count ?? first.results.length;
+    const cap = Math.min(total, DOQ_MAX_DOCTOR_PAGES * PAGE_SIZE);
+    const results: any[] = [...first.results];
+
+    if (cap <= PAGE_SIZE) return results;
+
+    const offsets: number[] = [];
+    for (let offset = PAGE_SIZE; offset < cap; offset += PAGE_SIZE) {
+        offsets.push(offset);
+    }
+
+    const pages = await Promise.all(
+        offsets.map(offset => getJson<any>(`${base}&offset=${offset}`))
+    );
+
+    for (const page of pages) {
+        if (page?.results) results.push(...page.results);
+    }
+
+    return results;
+}
+
+
+
+function branchRating(branch: any): number {
+
+    const score = Number(branch?.feedback_score);
+
+    if (!Number.isFinite(score)) return 4.2;
+
+    return Math.min(5, Math.round((score / 10) * 5 * 10) / 10);
+
+}
+
+
+
+function doctorsToRecords(
+
+    city: any,
+
+    doctors: any[],
+
+    parsedAt: Date
+
+): RawClinicRecord[] {
+
+    const out: RawClinicRecord[] = [];
+
+    const seen = new Set<string>();
+
+
+
+    for (const doctor of doctors) {
+
+        const services: any[] = doctor.services ?? [];
+
+        if (!services.length) continue;
+
+
+
+        const branches: any[] = doctor.clinic_branches ?? [];
+
+        const branchById = new Map<number, any>(
+
+            branches.map(b => [b.id, b])
+
+        );
+
+
+
+        for (const s of services) {
+
+            const name = s.service?.name;
+
+            const price = s.total ?? s.price ?? s.base_price;
+
+
+
+            if (!name || !price || Number(price) <= 0) continue;
+
+
+
+            const branch =
+
+                branchById.get(s.clinic_branch) ?? branches[0];
+
+            if (!branch) continue;
+
+
+
+            const clinicId = `doq-${city.id}-${branch.clinic ?? branch.id}`;
+
+            const dedupeKey = `${clinicId}|${name}|${price}`;
+
+            if (seen.has(dedupeKey)) continue;
+
+            seen.add(dedupeKey);
+
+
+
+            out.push({
+
+                clinic_id: clinicId,
+
+                clinic_name: branch.name ?? "Клиника DOQ",
+
+                city: city.name,
+
+                address: branch.address ?? "не указан",
+
+                phone: branch.phones?.[0] ?? "",
+
+                working_hours: "09:00-20:00",
+
+                source_url: `https://doq.kz/clinics/${city.slug}/${branch.clinic_slug ?? branch.slug}`,
+
+                service_name_raw: name,
+
+                category: "приём врача",
+
+                price_kzt: Number(price),
+
+                currency: "KZT",
+
+                duration_days: 0,
+
+                parsed_at: parsedAt,
+
+                is_active: true,
+
+                location: normalizeLocation(branch.location, city.name, clinicId),
+
+                online_booking: true,
+
+                rating: branchRating(branch)
+
+            });
+
+        }
+
+    }
+
+
+
+    return out;
+
+}
+
+
 
 export async function parseDoqPrices(): Promise<RawClinicRecord[]> {
+
     const parsedAt = new Date();
-    const offers: RawClinicRecord[] = [];
 
-    const citiesPayload = await safeFetchJson<any>(
+
+
+    const citiesPayload = await getJson<any>(
+
         "https://api.doq.kz/api/v1/cities"
+
     );
 
-    const cities = citiesPayload?.results ?? [];
+    if (!citiesPayload?.results) {
 
-    await Promise.all(
-        cities.map((city: any) =>
-            cityLimit(async () => {
-                const clinicsPayload = await safeFetchJson<any>(
-                    `https://api.doq.kz/api/v1/clinics/?city=${city.id}&expand=clinic_branches&limit=100`
-                );
+        throw new Error("DOQ: cannot load cities");
 
-                const clinics = clinicsPayload?.results ?? [];
+    }
 
-                await Promise.all(
-                    clinics.map((clinic: any) =>
-                        clinicLimit(async () => {
-                            const branch = clinic.clinic_branches?.[0];
-                            if (!branch) return;
 
-                            const doctorsPayload = await safeFetchJson<any>(
-                                `https://api.doq.kz/api/v1/doctors/?city=${city.id}&clinic=${clinic.id}&clinic_branch=${branch.id}&limit=100&expand=clinic_branches,services`
-                            );
 
-                            const doctors = doctorsPayload?.results ?? [];
-
-                            await Promise.all(
-                                doctors.map((doctor: any) =>
-                                    doctorLimit(() => {
-                                        const services = doctor.services ?? [];
-                                        const doctorBranch =
-                                            doctor.clinic_branches?.[0] ?? branch;
-
-                                        for (let i = 0; i < services.length; i++) {
-                                            const s = services[i];
-
-                                            const name = s.service?.name;
-                                            const price =
-                                                s.price ?? s.base_price ?? s.total;
-
-                                            if (!name || !price || price <= 0) continue;
-
-                                            offers.push({
-                                                clinic_id: `doq-${city.id}-${clinic.id}`,
-                                                clinic_name: clinic.name,
-                                                city: city.name,
-                                                address: doctorBranch.address ?? "не указан",
-                                                phone: doctorBranch.phones?.[0] ?? "",
-                                                working_hours: "09:00-20:00",
-                                                source_url: `https://doq.kz/clinics/${city.slug}/${clinic.slug}`,
-                                                service_name_raw: name,
-                                                category: "приём врача",
-                                                price_kzt: Number(price),
-                                                currency: "KZT",
-                                                duration_days: 0,
-                                                parsed_at: parsedAt,
-                                                is_active: true,
-                                                location: doctorBranch.location
-                                            });
-                                        }
-                                    })
-                                )
-                            );
-                        })
-                    )
-                );
-            })
-        )
+    const cities = limitCities<DoqCity>(
+        citiesPayload.results as DoqCity[],
+        DOQ_MAX_CITIES
     );
 
-    return offers;
+
+
+    console.log(
+
+        "DOQ:",
+
+        cities.length,
+
+        "cities —",
+
+        cities.map(c => c.name).join(", ")
+
+    );
+
+
+
+    const perCity = await Promise.all(
+
+        cities.map(async city => {
+
+            const doctors = await fetchAllDoctors(city.id);
+
+            const records = doctorsToRecords(city, doctors, parsedAt);
+
+            console.log(`DOQ ${city.name}: ${records.length} offers`);
+
+            return records;
+
+        })
+
+    );
+
+
+
+    const results = perCity.flat();
+
+    console.log("DOQ total:", results.length);
+
+    return results;
+
 }
+
+

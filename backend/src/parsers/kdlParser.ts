@@ -1,22 +1,19 @@
 import { Agent, fetch } from "undici";
 import { RawClinicRecord } from "../models";
+import { cityLocation } from "../geocoding";
+import { KDL_MAX_CITIES, limitCities } from "./config";
+import { kdlPricelistUrl, loadKdlCities, KdlCity } from "./kdlCities";
 
-interface City {
-    id: number;
-    slug: string;
-    title: string;
-}
-
-const BASE_URL =
-    "https://www.kdlolymp.kz/api/analysis-data";
-
-const CONCURRENCY = 40;
+const BASE_URL = "https://www.kdlolymp.kz/api/analysis-data";
+const CONCURRENCY = 10;
 
 const dispatcher = new Agent({
-    connections: 120,
-    pipelining: 8,
-    keepAliveTimeout: 120000,
-    keepAliveMaxTimeout: 120000
+    connections: 150,
+    pipelining: 1,
+    keepAliveTimeout: 60000,
+    keepAliveMaxTimeout: 60000,
+    bodyTimeout: 15000,
+    headersTimeout: 15000
 });
 
 const BASE_HEADERS = Object.freeze({
@@ -24,246 +21,133 @@ const BASE_HEADERS = Object.freeze({
     "User-Agent": "Mozilla/5.0"
 });
 
-async function fetchPage(
-    city: City,
-    page: number,
-    headers: Record<string, string>
-): Promise<{ url: string; json: any } | null> {
+async function fetchPage(city: KdlCity, page: number): Promise<any[] | null> {
     const url =
         BASE_URL +
-        "?lang=ru-RU&city_id=" +
-        city.id +
-        "&city_slug=" +
-        city.slug +
-        "&search=&per-page=100&page=" +
-        page;
+        "?lang=ru-RU&city_id=" + city.id +
+        "&city_slug=" + city.slug +
+        "&search=&per-page=500&page=" + page;
 
     try {
         const res = await fetch(url, {
             dispatcher,
-            headers
+            headers: {
+                ...BASE_HEADERS,
+                Referer: kdlPricelistUrl(city.slug),
+                Cookie: "accepted-city=" + city.id + "; currentCity=" + city.id
+            }
         });
 
         if (!res.ok) return null;
 
-        return {
-            url,
-            json: await res.json()
-        };
+        const json: any = await res.json();
+        return Array.isArray(json.data) ? json.data : null;
     } catch {
         return null;
     }
 }
 
-function extractInto(
-    city: City,
+function extractFromCategories(
+    city: KdlCity,
     parsedAt: Date,
-    url: string,
+    pricelistUrl: string,
     categories: any[],
-    out: RawClinicRecord[],
-    seen?: Set<string>
+    seen: Set<string>,
+    out: RawClinicRecord[]
 ) {
     const clinicId = "kdl-" + city.slug;
-    const cityTitle = city.title;
 
     for (let i = 0; i < categories.length; i++) {
         const analysis = categories[i].analysis;
-
         if (!Array.isArray(analysis)) continue;
 
         for (let j = 0; j < analysis.length; j++) {
             const item = analysis[j];
-
             const priceObj = item.price;
-
-            if (!priceObj) continue;
-
-            const price = priceObj.price;
-
-            if (price == null) continue;
+            if (!priceObj || priceObj.price == null) continue;
 
             const title =
-                item.translation?.title ||
-                item.name ||
-                item.slug ||
-                "";
+                item.translation?.title || item.name || item.slug || "";
+            const key = title + "|" + priceObj.price;
 
-            if (seen) {
-                const key = title + "|" + price;
-
-                if (seen.has(key)) continue;
-
-                seen.add(key);
-            }
+            if (seen.has(key)) continue;
+            seen.add(key);
 
             out.push({
                 clinic_id: clinicId,
                 clinic_name: "KDL",
-                city: cityTitle,
+                city: city.title,
                 address: "",
                 phone: "",
                 working_hours: "",
-                source_url: url,
+                source_url: pricelistUrl,
                 service_name_raw: title,
                 category: "лаборатория",
-                price_kzt: price,
+                price_kzt: priceObj.price,
                 currency: "KZT",
                 duration_days: priceObj.min_duration ?? 1,
                 parsed_at: parsedAt,
-                is_active: true
+                is_active: true,
+                location: cityLocation(city.title, clinicId),
+                online_booking: true,
+                rating: 4.4
             });
         }
     }
 }
 
-async function processCity(
-    city: City,
-    parsedAt: Date,
-    results: RawClinicRecord[]
-) {
-    const headers = {
-        ...BASE_HEADERS,
-        Referer:
-            "https://www.kdlolymp.kz/pricelist/" +
-            city.slug,
-        Cookie:
-            "accepted-city=" +
-            city.id +
-            "; currentCity=" +
-            city.id
-    };
+async function processCity(city: KdlCity, parsedAt: Date): Promise<RawClinicRecord[]> {
+    const out: RawClinicRecord[] = [];
+    const seen = new Set<string>();
+    const pricelistUrl = kdlPricelistUrl(city.slug);
 
-    const first = await fetchPage(city, 1, headers);
+    const categories1 = await fetchPage(city, 1);
+    if (!categories1) return out;
 
-    if (!first) return;
+    extractFromCategories(city, parsedAt, pricelistUrl, categories1, seen, out);
 
-    const categories = first.json.data;
-
-    if (!Array.isArray(categories)) return;
-
-    const before = results.length;
-
-    extractInto(
-        city,
-        parsedAt,
-        first.url,
-        categories,
-        results
+    const needsPage2 = categories1.some(
+        c => Array.isArray(c.analysis) && c.analysis.length === 500
     );
 
-    let secondNeeded = false;
-
-    for (let i = 0; i < categories.length; i++) {
-        const analysis = categories[i].analysis;
-
-        if (
-            Array.isArray(analysis) &&
-            analysis.length === 100
-        ) {
-            secondNeeded = true;
-            break;
+    if (needsPage2) {
+        const categories2 = await fetchPage(city, 2);
+        if (categories2) {
+            extractFromCategories(city, parsedAt, pricelistUrl, categories2, seen, out);
         }
     }
 
-    if (!secondNeeded) return;
-
-    const second = await fetchPage(city, 2, headers);
-
-    if (!second) return;
-
-    const secondCategories = second.json.data;
-
-    if (!Array.isArray(secondCategories)) return;
-
-    const seen = new Set<string>();
-
-    for (let i = before; i < results.length; i++) {
-        const r = results[i];
-        seen.add(r.service_name_raw + "|" + r.price_kzt);
-    }
-
-    extractInto(
-        city,
-        parsedAt,
-        second.url,
-        secondCategories,
-        results,
-        seen
-    );
+    return out;
 }
 
 export async function parseKdlPrices(): Promise<RawClinicRecord[]> {
-    const res = await fetch(
-        "https://www.kdlolymp.kz/api/area?cities=true&lang=ru-RU",
-        {
-            dispatcher,
-            headers: BASE_HEADERS
-        }
-    );
+    const cities = await loadKdlCities();
+    console.log("KDL cities available:", cities.length);
 
-    if (!res.ok) {
-        throw new Error("Cannot load cities");
-    }
-
-    const json: any = await res.json();
-
-    const cities: City[] = [];
-
-    const areas = json.data ?? [];
-
-    for (let i = 0; i < areas.length; i++) {
-        const areaCities = areas[i].cities;
-
-        if (!Array.isArray(areaCities)) continue;
-
-        for (let j = 0; j < areaCities.length; j++) {
-            const city = areaCities[j];
-
-            if (!city.is_active) continue;
-
-            cities.push({
-                id: city.id,
-                slug: city.slug,
-                title:
-                    city.translation?.title ??
-                    city.slug
-            });
-        }
-    }
-
-    console.log("Loaded", cities.length, "cities");
+    const selected = limitCities(cities, KDL_MAX_CITIES);
+    console.log("KDL parsing", selected.length, "cities");
 
     const parsedAt = new Date();
-
-    const results: RawClinicRecord[] = [];
-
+    const allResults: RawClinicRecord[][] = new Array(selected.length);
     let next = 0;
 
     async function worker() {
         while (true) {
             const index = next++;
-
-            if (index >= cities.length) return;
-
+            if (index >= selected.length) return;
             try {
-                await processCity(
-                    cities[index],
-                    parsedAt,
-                    results
-                );
-            } catch {}
+                allResults[index] = await processCity(selected[index], parsedAt);
+            } catch {
+                allResults[index] = [];
+            }
         }
     }
 
-    const workers = new Array(CONCURRENCY);
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 
-    for (let i = 0; i < CONCURRENCY; i++) {
-        workers[i] = worker();
-    }
-
-    await Promise.all(workers);
-
-    console.log("Collected", results.length, "offers");
-
+    const results = ([] as RawClinicRecord[]).concat(...allResults);
+    console.log("KDL collected", results.length, "offers");
     return results;
 }
+
+export { loadKdlCities, getKdlCityNames } from "./kdlCities";

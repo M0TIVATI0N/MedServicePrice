@@ -5,7 +5,8 @@ import {
     MapLocation,
     RawClinicRecord,
     ClinicServiceOffer,
-    PriceHistoryEntry
+    PriceHistoryEntry,
+    ParseLogEntry
 } from "./models";
 
 dotenv.config();
@@ -93,6 +94,8 @@ const RawRecordSchema = new Schema<RawRecordDoc>(
         is_active: { type: Boolean, index: true },
 
         location: locationSchema,
+        rating: Number,
+        online_booking: { type: Boolean, index: true },
 
         raw_hash: {
             type: String,
@@ -145,7 +148,9 @@ const OfferRecordSchema = new Schema<OfferRecordDoc>(
         parsed_at: { type: Date, index: true },
         is_active: { type: Boolean, index: true },
 
-        location: locationSchema
+        location: locationSchema,
+        rating: Number,
+        online_booking: { type: Boolean, index: true }
     },
     {
         ...schemaOptions,
@@ -184,6 +189,7 @@ const PriceHistorySchema = new Schema<PriceHistoryDoc>(
         service_name_norm: { type: String, index: true },
 
         price_kzt: Number,
+        previous_price_kzt: Number,
         parsed_at: { type: Date, index: true },
 
         source_url: String
@@ -209,4 +215,29 @@ export const PriceHistory = getModel<PriceHistoryDoc>(
     "PriceHistory",
     PriceHistorySchema,
     "price_history"
+);
+
+/* -------------------- PARSE LOG -------------------- */
+
+export interface ParseLogDoc extends ParseLogEntry, Document {}
+
+const ParseLogSchema = new Schema<ParseLogDoc>(
+    {
+        source: { type: String, required: true, index: true },
+        level: { type: String, index: true },
+        message: String,
+        parsed_at: { type: Date, index: true }
+    },
+    {
+        ...schemaOptions,
+        collection: "parse_logs"
+    }
+);
+
+ParseLogSchema.index({ parsed_at: -1 });
+
+export const ParseLog = getModel<ParseLogDoc>(
+    "ParseLog",
+    ParseLogSchema,
+    "parse_logs"
 );

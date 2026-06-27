@@ -1,9 +1,12 @@
-import { useEffect, useMemo, useState } from 'react';
-import { MapContainer, Marker, Popup, TileLayer } from 'react-leaflet';
+import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
+import { MapContainer, Marker, Popup, TileLayer, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import iconUrl from 'leaflet/dist/images/marker-icon.png';
 import iconShadowUrl from 'leaflet/dist/images/marker-shadow.png';
 import 'leaflet/dist/leaflet.css';
+import { fetchJson, asArray } from './api';
+import { CollapsiblePanel } from './CollapsiblePanel';
+import { publicSourceUrl } from './clinicUrl';
 
 interface ServiceOffer {
   clinic_id: string;
@@ -19,6 +22,9 @@ interface ServiceOffer {
   category: string;
   price_kzt: number;
   parsed_at: string;
+  rating?: number;
+  online_booking?: boolean;
+  distance_km?: number;
   location?: { lat: number; lng: number };
 }
 
@@ -30,258 +36,660 @@ interface Clinic {
   phone: string;
   working_hours: string;
   source_url: string;
+  rating?: number;
+  online_booking?: boolean;
   location?: { lat: number; lng: number };
-  services: ServiceOffer[];
+  service_count?: number;
+  min_price?: number;
+  services?: ServiceOffer[];
+}
+
+interface CatalogItem {
+  service_id: string;
+  service_name_norm: string;
+  category: string;
 }
 
 interface PriceHistoryItem {
   price_kzt: number;
+  previous_price_kzt?: number;
   parsed_at: string;
 }
 
+interface Stats {
+  active_offers: number;
+  clinics: number;
+  sources: number;
+  catalog_size: number;
+  freshness_days: number;
+}
+
 delete (L.Icon.Default.prototype as any)._getIconUrl;
-L.Icon.Default.mergeOptions({
-  iconUrl,
-  shadowUrl: iconShadowUrl,
-  iconRetinaUrl: iconUrl
+L.Icon.Default.mergeOptions({ iconUrl, shadowUrl: iconShadowUrl, iconRetinaUrl: iconUrl });
+
+const clinicIcon = L.icon({
+  iconUrl, shadowUrl: iconShadowUrl,
+  iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34]
 });
 
-function App() {
-  const [query, setQuery] = useState('');
-  const [city, setCity] = useState('');
-  const [category, setCategory] = useState('');
-  const [priceMin, setPriceMin] = useState('0');
-  const [priceMax, setPriceMax] = useState('20000');
-  const [sort, setSort] = useState('price_asc');
-  const [offers, setOffers] = useState<ServiceOffer[]>([]);
-  const [clinics, setClinics] = useState<Clinic[]>([]);
-  const [selectedClinic, setSelectedClinic] = useState<string | null>(null);
-  const [history, setHistory] = useState<PriceHistoryItem[]>([]);
-  const [showMap, setShowMap] = useState(true);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-    const [cities, setCities] = useState<string[]>([]);
-    const [categories, setCategories] = useState<string[]>([]);
+const userIcon = L.divIcon({
+  className: 'user-location-marker',
+  html: '<div class="user-dot"></div>',
+  iconSize: [22, 22], iconAnchor: [11, 11]
+});
 
+function MapRecenter({ lat, lng }: { lat: number; lng: number }) {
+  const map = useMap();
+  useEffect(() => { map.setView([lat, lng], map.getZoom()); }, [lat, lng, map]);
+  return null;
+}
 
+function ClinicPopupContent({ clinic, onSelect }: { clinic: Clinic; onSelect: (c: Clinic) => void }) {
+  const map = useMap();
+  return (
+    <div className="map-popup">
+      <strong>{clinic.clinic_name}</strong>
+      {clinic.address && <div className="map-popup-address">{clinic.address}</div>}
+      <button type="button" className="popup-button"
+        onMouseDown={e => { e.preventDefault(); e.stopPropagation(); }}
+        onClick={e => { e.preventDefault(); e.stopPropagation(); map.closePopup(); onSelect(clinic); }}>
+        Услуги клиники
+      </button>
+    </div>
+  );
+}
+
+function useDebounce<T>(value: T, delay: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(t);
+  }, [value, delay]);
+  return debounced;
+}
+
+const PAGE_SIZE = 50;
+const DEFAULT_CENTER = { lat: 43.2567, lng: 76.9286 };
+const POPULAR_SEARCHES = ['ОАК', 'УЗИ брюшной полости', 'Биохимический анализ крови', 'Консультация терапевта', 'ЭКГ'] as const;
+const DATA_SOURCES = ['KDL', 'DOQ', 'ИНВИТРО', 'Helix', 'Гемотест'];
+
+function offerKey(o: ServiceOffer) {
+  return `${o.clinic_id}-${o.service_id}`;
+}
+
+export default function App() {
   const apiBase = import.meta.env.VITE_API_BASE_URL || '/api';
   const mapsUrl = import.meta.env.VITE_GOOGLE_MAPS_URL || 'https://www.google.com/maps/dir/?api=1';
 
-    useEffect(() => {
-    fetch(`${apiBase}/cities`)
-        .then(r => r.json())
-        .then(setCities)
-        .catch(() => setCities([]));
+  const [city, setCity] = useState('');
+  const [query, setQuery] = useState('');
+  const [selectedServiceId, setSelectedServiceId] = useState('');
+  const [category, setCategory] = useState('');
+  const [priceMin, setPriceMin] = useState('0');
+  const [priceMax, setPriceMax] = useState('100000');
+  const [ratingMin, setRatingMin] = useState('0');
+  const [onlineOnly, setOnlineOnly] = useState(false);
+  const [sort, setSort] = useState('price_asc');
+  const [page, setPage] = useState(1);
+  const [userLocation, setUserLocation] = useState<{ lat: number; lng: number } | null>(null);
 
-    fetch(`${apiBase}/categories`)
-        .then(r => r.json())
-        .then(setCategories)
-        .catch(() => setCategories([]));
-    }, [apiBase]);
-  const searchParams = useMemo(() => {
-    const params = new URLSearchParams();
-    if (query.trim()) params.set('query', query.trim());
-    if (city) params.set('city', city);
-    if (category) params.set('category', category);
-    if (priceMin) params.set('priceMin', priceMin);
-    if (priceMax) params.set('priceMax', priceMax);
-    if (sort) params.set('sort', sort);
-    return params.toString();
-  }, [query, city, category, priceMin, priceMax, sort]);
+  const [offers, setOffers] = useState<ServiceOffer[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
+  const [clinics, setClinics] = useState<Clinic[]>([]);
+  const [selectedClinic, setSelectedClinic] = useState<Clinic | null>(null);
+  const [clinicPanelOpen, setClinicPanelOpen] = useState(true);
+  const [cities, setCities] = useState<string[]>([]);
+  const [categories, setCategories] = useState<string[]>([]);
+  const [catalogHints, setCatalogHints] = useState<CatalogItem[]>([]);
+  const [showHints, setShowHints] = useState(false);
+  const [stats, setStats] = useState<Stats | null>(null);
+
+  const [compareIds, setCompareIds] = useState<Set<string>>(new Set());
+  const [showCompare, setShowCompare] = useState(false);
+  const [comparePanelOpen, setComparePanelOpen] = useState(true);
+  const [compareData, setCompareData] = useState<ServiceOffer[]>([]);
+
+  const [historyOffer, setHistoryOffer] = useState<ServiceOffer | null>(null);
+  const [historyPanelOpen, setHistoryPanelOpen] = useState(true);
+  const [history, setHistory] = useState<PriceHistoryItem[]>([]);
+
+  const [showMap, setShowMap] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [clinicLoading, setClinicLoading] = useState(false);
+  const [parsing, setParsing] = useState(false);
+  const [parseMessage, setParseMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const searchRef = useRef<HTMLDivElement>(null);
+  const historyRef = useRef<HTMLElement>(null);
+  const clinicPanelRef = useRef<HTMLElement>(null);
+  const debouncedQuery = useDebounce(query, 400);
 
   useEffect(() => {
-    setLoading(true);
-    setError(null);
-    const PAGE_SIZE = 50;
-
-    fetch(
-    `${apiBase}/services?${searchParams}&page=1&limit=${PAGE_SIZE}`
-    )
-      .then((res) => res.json())
-      .then((data) => setOffers(data.data ?? []))
-      .catch(() => setError('Не удалось загрузить данные.'))
-      .finally(() => setLoading(false));
-  }, [apiBase, searchParams]);
+    fetchJson<string[]>(`${apiBase}/cities`).then(d => setCities(asArray(d))).catch(() => {});
+    fetchJson<Stats>(`${apiBase}/stats`).then(d => { if (d) setStats(d); }).catch(() => {});
+  }, [apiBase]);
 
   useEffect(() => {
-    fetch(`${apiBase}/clinics?city=${encodeURIComponent(city)}`)
-      .then((res) => res.json())
-      .then((data) => setClinics(data))
-      .catch(() => setClinics([]));
+    if (!city) {
+      setCategories([]);
+      setOffers([]);
+      setTotalCount(0);
+      setClinics([]);
+      setSelectedClinic(null);
+      setCompareIds(new Set());
+      return;
+    }
+    fetchJson<string[]>(`${apiBase}/categories?city=${encodeURIComponent(city)}`)
+      .then(d => setCategories(asArray(d)))
+      .catch(() => setCategories([]));
   }, [apiBase, city]);
 
   useEffect(() => {
-    if (!selectedClinic) {
-      setHistory([]);
+    if (!debouncedQuery.trim() || !city) { setCatalogHints([]); return; }
+    fetchJson<CatalogItem[]>(`${apiBase}/catalog/search?q=${encodeURIComponent(debouncedQuery)}&limit=10`)
+      .then(d => setCatalogHints(asArray(d)))
+      .catch(() => setCatalogHints([]));
+  }, [apiBase, debouncedQuery, city]);
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (searchRef.current && !searchRef.current.contains(e.target as Node)) setShowHints(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  useEffect(() => { setPage(1); }, [debouncedQuery, selectedServiceId, city, category, priceMin, priceMax, ratingMin, onlineOnly, sort, userLocation]);
+
+  const searchParams = useMemo(() => {
+    const p = new URLSearchParams();
+    if (!city) return '';
+    p.set('city', city);
+    if (selectedServiceId) p.set('service_id', selectedServiceId);
+    else if (debouncedQuery.trim()) p.set('query', debouncedQuery.trim());
+    if (category) p.set('category', category);
+    if (Number(priceMin) > 0) p.set('priceMin', priceMin);
+    if (Number(priceMax) < 100000) p.set('priceMax', priceMax);
+    if (Number(ratingMin) > 0) p.set('ratingMin', ratingMin);
+    if (onlineOnly) p.set('online_booking', 'true');
+    if (userLocation && sort === 'distance') {
+      p.set('lat', String(userLocation.lat));
+      p.set('lng', String(userLocation.lng));
+    }
+    p.set('sort', sort);
+    p.set('page', String(page));
+    p.set('limit', String(PAGE_SIZE));
+    return p.toString();
+  }, [debouncedQuery, selectedServiceId, city, category, priceMin, priceMax, ratingMin, onlineOnly, sort, page, userLocation]);
+
+  const clinicParams = useMemo(() => {
+    if (!city) return '';
+    const p = new URLSearchParams();
+    p.set('city', city);
+    if (selectedServiceId) p.set('service_id', selectedServiceId);
+    else if (debouncedQuery.trim()) p.set('query', debouncedQuery.trim());
+    return p.toString();
+  }, [city, debouncedQuery, selectedServiceId]);
+
+  useEffect(() => {
+    if (!city || !searchParams) {
+      setOffers([]);
+      setTotalCount(0);
       return;
     }
-    fetch(`${apiBase}/history?clinic_id=${selectedClinic}`)
-      .then((res) => res.json())
-      .then((data) => setHistory(data))
-      .catch(() => setHistory([]));
-  }, [apiBase, selectedClinic]);
+    setLoading(true);
+    setError(null);
+    const controller = new AbortController();
+    fetchJson<{ data?: ServiceOffer[]; count?: number }>(`${apiBase}/services?${searchParams}`, controller.signal)
+      .then(data => {
+        setOffers(asArray(data?.data));
+        setTotalCount(data?.count ?? 0);
+      })
+      .catch(err => {
+        if (err.name !== 'AbortError') setError('Не удалось загрузить данные.');
+      })
+      .finally(() => setLoading(false));
+    return () => controller.abort();
+  }, [apiBase, searchParams, city]);
 
-  const selectedClinicData = clinics.find((clinic) => clinic.clinic_id === selectedClinic);
-  const mapCenter = selectedClinicData?.location ?? clinics[0]?.location ?? { lat: 43.2567, lng: 76.9286 };
+  useEffect(() => {
+    if (!city || !clinicParams) { setClinics([]); return; }
+    fetchJson<Clinic[]>(`${apiBase}/clinics?${clinicParams}`)
+      .then(d => setClinics(asArray(d)))
+      .catch(() => setClinics([]));
+  }, [apiBase, clinicParams, city]);
+
+  useEffect(() => {
+    if (!historyOffer) { setHistory([]); return; }
+    fetchJson<PriceHistoryItem[]>(
+      `${apiBase}/history?clinic_id=${historyOffer.clinic_id}&service_id=${historyOffer.service_id}`
+    ).then(d => setHistory(asArray(d))).catch(() => setHistory([]));
+  }, [apiBase, historyOffer]);
+
+  const mapCenter = selectedClinic?.location ?? clinics.find(c => c.location)?.location ?? userLocation ?? DEFAULT_CENTER;
+
+  const handleSelectClinic = useCallback(async (clinic: Clinic) => {
+    setSelectedClinic({ ...clinic, services: clinic.services ?? [] });
+    setClinicPanelOpen(true);
+    setClinicLoading(true);
+    try {
+      const full = await fetchJson<Clinic>(`${apiBase}/clinics/${clinic.clinic_id}`);
+      if (full) setSelectedClinic(full);
+    } finally {
+      setClinicLoading(false);
+      setTimeout(() => clinicPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
+    }
+  }, [apiBase]);
+
+  const toggleCompare = useCallback((offer: ServiceOffer) => {
+    setCompareIds(prev => {
+      const next = new Set(prev);
+      const key = offerKey(offer);
+      if (next.has(key)) next.delete(key);
+      else if (next.size < 4) next.add(key);
+      return next;
+    });
+  }, []);
+
+  const runCompare = useCallback(() => {
+    const selected = offers.filter(o => compareIds.has(offerKey(o)));
+    if (selected.length < 2) return;
+    if (new Set(selected.map(o => o.service_id)).size !== 1) {
+      setError('Для сравнения выберите одну услугу в разных клиниках.');
+      return;
+    }
+    setCompareData(selected.sort((a, b) => a.price_kzt - b.price_kzt));
+    setShowCompare(true);
+    setComparePanelOpen(true);
+  }, [compareIds, offers]);
+
+  const openHistory = useCallback((offer: ServiceOffer) => {
+    setHistoryOffer(offer);
+    setHistoryPanelOpen(true);
+    setTimeout(() => historyRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
+  }, []);
+
+  const requestLocation = useCallback(() => {
+    if (!navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition(
+      pos => { setUserLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude }); setSort('distance'); },
+      () => setError('Не удалось определить геолокацию.')
+    );
+  }, []);
+
+  const triggerParse = useCallback(() => {
+    setParsing(true);
+    setParseMessage('Парсинг запущен, подождите...');
+    fetch(`${apiBase}/parse`, { method: 'POST' })
+      .then(() => {
+        let attempts = 0;
+        const poll = () => {
+          fetch(`${apiBase}/parse/status`)
+            .then(r => r.json())
+            .then(data => {
+              setStats(prev => ({
+                active_offers: data.active_offers,
+                clinics: data.clinics,
+                sources: prev?.sources ?? 0,
+                catalog_size: prev?.catalog_size ?? 133,
+                freshness_days: data.freshness_days ?? 30
+              }));
+              attempts++;
+              if (data.active_offers > 0 || attempts >= 90) {
+                setParsing(false);
+                setParseMessage(
+                  data.active_offers > 0
+                    ? `Обновлено: ${data.active_offers.toLocaleString('ru-RU')} предложений, ${data.clinics} клиник`
+                    : 'Парсинг завершён. Нажмите «Обновить прайсы» ещё раз, если данных нет.'
+                );
+                fetchJson<string[]>(`${apiBase}/cities`).then(d => setCities(asArray(d)));
+                if (city) fetchJson<string[]>(`${apiBase}/categories?city=${encodeURIComponent(city)}`).then(d => setCategories(asArray(d)));
+                return;
+              }
+              setTimeout(poll, 2000);
+            })
+            .catch(() => { setParsing(false); setParseMessage(null); });
+        };
+        setTimeout(poll, 2000);
+      })
+      .catch(() => { setParsing(false); setParseMessage(null); });
+  }, [apiBase, city]);
+
+  const selectCatalogItem = (item: CatalogItem) => {
+    setQuery(item.service_name_norm);
+    setSelectedServiceId(item.service_id);
+    setShowHints(false);
+  };
+
+  const quickSearch = (term: string) => { setQuery(term); setSelectedServiceId(''); setShowHints(false); };
+
+  const clearFilters = () => {
+    setQuery('');
+    setSelectedServiceId('');
+    setCategory('');
+    setPriceMin('0');
+    setPriceMax('100000');
+    setRatingMin('0');
+    setOnlineOnly(false);
+    setSort('price_asc');
+  };
+
+  const hasActiveFilters = !!(query || selectedServiceId || category || Number(priceMin) > 0 || Number(priceMax) < 100000 || Number(ratingMin) > 0 || onlineOnly);
+  const totalPages = Math.ceil(totalCount / PAGE_SIZE);
+  const clinicsWithLocation = clinics.filter(c => c.location);
+  const lowestPrice = offers.length > 0 ? Math.min(...offers.map(o => o.price_kzt)) : null;
 
   return (
     <div className="app-shell">
       <header className="hero">
-        <div>
-          <p className="eyebrow">MedServicePrice.kz</p>
+        <div className="hero-content">
+          <p className="eyebrow">MedServicePrice.kz · Хакатон 2025</p>
           <h1>Сравнение цен на медицинские услуги в Казахстане</h1>
-          <p className="subtitle">
-            Поиск анализов, приёма врачей и диагностики с актуальными прайсами, картой и историей изменений.
-          </p>
+          <p className="subtitle">Как Aviasales, но для медицины — сначала выберите город, затем сравнивайте цены клиник.</p>
+          <div className="source-badges">
+            {DATA_SOURCES.map(s => <span key={s} className="source-badge">{s}</span>)}
+          </div>
+          {stats && (
+            <p className="stats-bar">
+              {stats.active_offers.toLocaleString('ru-RU')} предложений · {stats.clinics} клиник · {stats.catalog_size} услуг · актуальность {stats.freshness_days} дн.
+            </p>
+          )}
+          {parseMessage && <p className="parse-message">{parseMessage}</p>}
+        </div>
+        <div className="hero-actions">
+          <button type="button" className="secondary-button" onClick={triggerParse} disabled={parsing}>
+            {parsing ? 'Обновление...' : 'Обновить прайсы'}
+          </button>
         </div>
       </header>
 
       <main className="panel">
-        <section className="controls controls-grid">
-          <div className="control-group">
-            <label>Услуга</label>
-            <input
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Например, ОАК или УЗИ малого таза"
-            />
-          </div>
-          <div className="control-group">
-            <label>Город</label>
-            <select value={city} onChange={(event) => setCity(event.target.value)}>
-              <option value="">Все города</option>
-              {cities.map((item) => (
-                <option key={item} value={item}>
-                  {item}
-                </option>
-              ))}
+        <section className="city-gate">
+          <div className="control-group city-gate-select">
+            <label>1. Выберите город ({cities.length || '…'} доступно)</label>
+            <select value={city} onChange={e => setCity(e.target.value)} className="city-select-large">
+              <option value="">— Выберите город —</option>
+              {cities.map(c => <option key={c} value={c}>{c}</option>)}
             </select>
           </div>
-          <div className="control-group">
-            <label>Категория</label>
-            <select value={category} onChange={(event) => setCategory(event.target.value)}>
-              <option value="">Все категории</option>
-              {categories.map((item) => (
-                <option key={item} value={item}>
-                  {item}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="control-group">
-            <label>Цена от</label>
-            <input type="number" min={0} value={priceMin} onChange={(event) => setPriceMin(event.target.value)} />
-          </div>
-          <div className="control-group">
-            <label>Цена до</label>
-            <input type="number" min={0} value={priceMax} onChange={(event) => setPriceMax(event.target.value)} />
-          </div>
-          <div className="control-group">
-            <label>Сортировка</label>
-            <select value={sort} onChange={(event) => setSort(event.target.value)}>
-              <option value="price_asc">Цена по возрастанию</option>
-              <option value="price_desc">Цена по убыванию</option>
-            </select>
-          </div>
+          {!city && (
+            <p className="city-gate-hint">После выбора города загрузятся клиники, карта и цены на услуги в вашем регионе.</p>
+          )}
         </section>
 
-        <section className="map-toggle-row">
-          <button type="button" className="primary-button" onClick={() => setShowMap((value) => !value)}>
-            {showMap ? 'Скрыть карту' : 'Показать карту'}
-          </button>
-        </section>
-
-        {showMap && (
-          <section className="map-panel">
-            <MapContainer center={[mapCenter.lat, mapCenter.lng]} zoom={11} scrollWheelZoom={false} className="map-container">
-              <TileLayer url="https://tile.openstreetmap.org/{z}/{x}/{y}.png" />
-              {clinics.map((clinic) =>
-                clinic.location ? (
-                  <Marker key={clinic.clinic_id} position={[clinic.location.lat, clinic.location.lng]}>
-                    <Popup>
-                      <strong>{clinic.clinic_name}</strong>
-                      <div>{clinic.address}</div>
-                      <button type="button" className="popup-button" onClick={() => setSelectedClinic(clinic.clinic_id)}>
-                        Показать клинику
-                      </button>
-                    </Popup>
-                  </Marker>
-                ) : null
-              )}
-            </MapContainer>
-          </section>
-        )}
-
-        <section className="results">
-          <div className="results-header">
-            <h2>Результаты</h2>
-            <span>{offers.length} предложений</span>
-          </div>
-
-          {loading && <p className="status">Загрузка...</p>}
-          {error && <p className="status status-error">{error}</p>}
-          {!loading && !error && offers.length === 0 && <p className="status">Нет предложений по запросу.</p>}
-
-          <div className="grid">
-            {offers.map((offer) => (
-              <article key={`${offer.clinic_id}-${offer.service_id}`} className="card">
-                <div className="card-header">
-                  <h3>{offer.clinic_name}</h3>
-                  <span className="badge">{offer.category}</span>
+        {city && (
+          <>
+            <section className="controls controls-grid">
+              <div className="control-group search-group search-group-wide" ref={searchRef}>
+                <label>2. Услуга</label>
+                <input value={query}
+                  onChange={e => { setQuery(e.target.value); setSelectedServiceId(''); setShowHints(true); }}
+                  onFocus={() => setShowHints(true)}
+                  placeholder="Например, ОАК, УЗИ или консультация терапевта" autoComplete="off" />
+                {showHints && catalogHints.length > 0 && (
+                  <ul className="autocomplete-list">
+                    {catalogHints.map(h => (
+                      <li key={h.service_id}>
+                        <button type="button" onClick={() => selectCatalogItem(h)}>
+                          <span>{h.service_name_norm}</span>
+                          <span className="hint-category">{h.category}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <div className="popular-chips">
+                  <span className="chips-label">Популярное:</span>
+                  {POPULAR_SEARCHES.map(term => (
+                    <button key={term} type="button" className="chip" onClick={() => quickSearch(term)}>{term}</button>
+                  ))}
                 </div>
-                <p className="service-name">{offer.service_name_norm}</p>
-                <div className="price-row">
-                  <strong>{offer.price_kzt.toLocaleString('ru-RU')} ₸</strong>
-                  <span>{new Date(offer.parsed_at).toLocaleDateString('ru-RU')}</span>
-                </div>
-                <div className="clinic-meta">
-                  <p>{offer.city}</p>
-                  <p>{offer.address}</p>
-                  <p>{offer.working_hours}</p>
-                </div>
-                <div className="clinic-actions">
-                  <a href={offer.source_url} target="_blank" rel="noreferrer">
-                    Источник
-                  </a>
-                  <a href={`tel:${offer.phone}`}>{offer.phone}</a>
-                </div>
-                <div className="clinic-actions">
-                  <a
-                    href={`${mapsUrl}&destination=${encodeURIComponent(`${offer.address}`)}`}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    Маршрут
-                  </a>
-                </div>
-              </article>
-            ))}
-          </div>
-        </section>
+              </div>
 
-        {selectedClinicData && (
-          <section className="details-panel">
-            <h2>Клиника: {selectedClinicData.clinic_name}</h2>
-            <p>{selectedClinicData.address}</p>
-            <p>{selectedClinicData.phone}</p>
-            <p>{selectedClinicData.working_hours}</p>
-            <h3>История цен</h3>
-            {history.length === 0 ? (
-              <p className="status">История цен не найдена.</p>
-            ) : (
-              <ul className="history-list">
-                {history.map((item, index) => (
-                  <li key={index}>
-                    {new Date(item.parsed_at).toLocaleDateString('ru-RU')} — {item.price_kzt.toLocaleString('ru-RU')} ₸
-                  </li>
-                ))}
-              </ul>
+              <div className="control-group">
+                <label>Категория</label>
+                <select value={category} onChange={e => setCategory(e.target.value)}>
+                  <option value="">Все категории</option>
+                  {categories.map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+              <div className="control-group">
+                <label>Цена от (тг)</label>
+                <input type="number" min={0} value={priceMin} onChange={e => setPriceMin(e.target.value)} />
+              </div>
+              <div className="control-group">
+                <label>Цена до (тг)</label>
+                <input type="number" min={0} value={priceMax} onChange={e => setPriceMax(e.target.value)} />
+              </div>
+              <div className="control-group">
+                <label>Рейтинг от</label>
+                <select value={ratingMin} onChange={e => setRatingMin(e.target.value)}>
+                  <option value="0">Любой</option>
+                  <option value="3">3+</option>
+                  <option value="4">4+</option>
+                  <option value="4.5">4.5+</option>
+                </select>
+              </div>
+              <div className="control-group checkbox-group">
+                <label>
+                  <input type="checkbox" checked={onlineOnly} onChange={e => setOnlineOnly(e.target.checked)} />
+                  Только с онлайн-записью
+                </label>
+              </div>
+              <div className="control-group">
+                <label>Сортировка</label>
+                <select value={sort} onChange={e => setSort(e.target.value)}>
+                  <option value="price_asc">Цена ↑</option>
+                  <option value="price_desc">Цена ↓</option>
+                  <option value="date_desc">Свежее</option>
+                  <option value="rating_desc">Рейтинг</option>
+                  <option value="distance">По расстоянию</option>
+                </select>
+              </div>
+            </section>
+
+            {hasActiveFilters && (
+              <section className="active-filters">
+                <span className="active-filters-label">Фильтры ({city}):</span>
+                <button type="button" className="link-button" onClick={clearFilters}>Сбросить фильтры</button>
+              </section>
             )}
-          </section>
+
+            <section className="toolbar">
+              <span className="city-badge">{city}</span>
+              <button type="button" className="secondary-button" onClick={requestLocation}>Рядом со мной</button>
+              <button type="button" className="secondary-button" onClick={() => setShowMap(v => !v)}>
+                {showMap ? 'Скрыть карту' : 'Показать карту'}
+              </button>
+              {compareIds.size >= 2 && (
+                <button type="button" className="primary-button" onClick={runCompare}>Сравнить ({compareIds.size})</button>
+              )}
+              {clinicsWithLocation.length > 0 && (
+                <span className="map-hint">{clinics.length} клиник · {clinicsWithLocation.length} на карте</span>
+              )}
+            </section>
+
+            {selectedClinic && (
+              <CollapsiblePanel
+                title={`${selectedClinic.clinic_name} — услуги (${selectedClinic.services?.length ?? selectedClinic.service_count ?? '…'})`}
+                open={clinicPanelOpen}
+                onToggle={() => setClinicPanelOpen(v => !v)}
+                onClose={() => setSelectedClinic(null)}
+                panelRef={clinicPanelRef}
+              >
+                {selectedClinic.rating && <p>Рейтинг: {selectedClinic.rating.toFixed(1)} ★</p>}
+                {selectedClinic.address && <p>{selectedClinic.address}</p>}
+                {selectedClinic.phone && <p><a href={`tel:${selectedClinic.phone}`}>{selectedClinic.phone}</a></p>}
+                {selectedClinic.working_hours && <p>{selectedClinic.working_hours}</p>}
+                {publicSourceUrl(selectedClinic.clinic_id, selectedClinic.source_url) && (
+                  <p><a href={publicSourceUrl(selectedClinic.clinic_id, selectedClinic.source_url)} target="_blank" rel="noreferrer">Сайт клиники</a></p>
+                )}
+                {clinicLoading ? (
+                  <p className="status"><span className="spinner" /> Загрузка услуг...</p>
+                ) : (
+                  <ul className="history-list services-scroll">
+                    {(selectedClinic.services ?? []).slice().sort((a, b) => a.price_kzt - b.price_kzt).map((s, i) => (
+                      <li key={i}>
+                        <span>{s.service_name_norm || s.service_name_raw}</span>
+                        <strong>{s.price_kzt.toLocaleString('ru-RU')} тг</strong>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </CollapsiblePanel>
+            )}
+
+            {historyOffer && (
+              <CollapsiblePanel
+                title={`История цен: ${historyOffer.service_name_norm || historyOffer.service_name_raw}`}
+                open={historyPanelOpen}
+                onToggle={() => setHistoryPanelOpen(v => !v)}
+                onClose={() => setHistoryOffer(null)}
+                panelRef={historyRef}
+              >
+                <p className="muted">{historyOffer.clinic_name}, {historyOffer.city}</p>
+                <ul className="history-list">
+                  {(history.length === 0 ? [{ price_kzt: historyOffer.price_kzt, parsed_at: historyOffer.parsed_at }] : history).map((h, i) => (
+                    <li key={i}>
+                      <span>{new Date(h.parsed_at).toLocaleString('ru-RU')}</span>
+                      <strong>
+                        {'previous_price_kzt' in h && h.previous_price_kzt !== undefined && (
+                          <span className="price-old">{h.previous_price_kzt.toLocaleString('ru-RU')} → </span>
+                        )}
+                        {h.price_kzt.toLocaleString('ru-RU')} тг
+                      </strong>
+                    </li>
+                  ))}
+                </ul>
+              </CollapsiblePanel>
+            )}
+
+            {showCompare && compareData.length > 0 && (
+              <CollapsiblePanel
+                title="Сравнение клиник"
+                open={comparePanelOpen}
+                onToggle={() => setComparePanelOpen(v => !v)}
+                onClose={() => setShowCompare(false)}
+              >
+                <table className="compare-table">
+                  <thead>
+                    <tr><th>Клиника</th><th>Город</th><th>Цена</th><th>Рейтинг</th><th>Обновлено</th></tr>
+                  </thead>
+                  <tbody>
+                    {compareData.map(o => (
+                      <tr key={offerKey(o)}>
+                        <td>{o.clinic_name}</td>
+                        <td>{o.city}</td>
+                        <td><strong>{o.price_kzt.toLocaleString('ru-RU')} тг</strong></td>
+                        <td>{o.rating ? `${o.rating.toFixed(1)} ★` : '—'}</td>
+                        <td>{new Date(o.parsed_at).toLocaleDateString('ru-RU')}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </CollapsiblePanel>
+            )}
+
+            {showMap && (
+              <section className="map-panel">
+                <MapContainer center={[mapCenter.lat, mapCenter.lng]} zoom={11} scrollWheelZoom={false} className="map-container">
+                  <TileLayer url="https://tile.openstreetmap.org/{z}/{x}/{y}.png" />
+                  <MapRecenter lat={mapCenter.lat} lng={mapCenter.lng} />
+                  {userLocation && (
+                    <Marker position={[userLocation.lat, userLocation.lng]} icon={userIcon}>
+                      <Popup>Вы здесь</Popup>
+                    </Marker>
+                  )}
+                  {clinics.map(clinic => clinic.location ? (
+                    <Marker key={clinic.clinic_id} position={[clinic.location.lat, clinic.location.lng]} icon={clinicIcon}>
+                      <Popup><ClinicPopupContent clinic={clinic} onSelect={handleSelectClinic} /></Popup>
+                    </Marker>
+                  ) : null)}
+                </MapContainer>
+              </section>
+            )}
+
+            <section className="results">
+              <div className="results-header">
+                <h2>Результаты — {city}</h2>
+                <span>{loading ? '...' : `${totalCount} предложений · ${clinics.length} клиник`}</span>
+              </div>
+
+              {loading && <p className="status"><span className="spinner" /> Загрузка...</p>}
+              {error && <p className="status status-error">{error}</p>}
+              {!loading && !error && offers.length === 0 && (
+                <div className="empty-state">
+                  <p className="empty-title">В городе {city} предложений не найдено</p>
+                  <p className="empty-hint">Попробуйте другую услугу или нажмите «Обновить прайсы» для загрузки данных по этому городу.</p>
+                </div>
+              )}
+
+              <div className="grid">
+                {offers.map(offer => {
+                  const key = offerKey(offer);
+                  const isCompared = compareIds.has(key);
+                  const isBestPrice = lowestPrice !== null && offer.price_kzt === lowestPrice && offers.length > 1;
+                  const clinicSummary = clinics.find(c => c.clinic_id === offer.clinic_id);
+                  const siteUrl = publicSourceUrl(offer.clinic_id, offer.source_url);
+                  return (
+                    <article key={`${key}-${offer.city}`} className={`card ${isCompared ? 'card-selected' : ''}`}>
+                      <div className="card-header">
+                        <h3>
+                          <button type="button" className="clinic-link" onClick={() => handleSelectClinic(clinicSummary ?? {
+                            clinic_id: offer.clinic_id, clinic_name: offer.clinic_name, city: offer.city,
+                            address: offer.address, phone: offer.phone, working_hours: offer.working_hours,
+                            source_url: offer.source_url, rating: offer.rating, online_booking: offer.online_booking,
+                            location: offer.location
+                          })}>{offer.clinic_name}</button>
+                        </h3>
+                        <div className="card-badges">
+                          {isBestPrice && <span className="badge badge-best">Лучшая цена</span>}
+                          <span className="badge">{offer.category}</span>
+                          {offer.online_booking && <span className="badge badge-green">Онлайн</span>}
+                        </div>
+                      </div>
+                      <p className="service-name">{offer.service_name_norm || offer.service_name_raw}</p>
+                      <div className="price-row">
+                        <strong>{offer.price_kzt.toLocaleString('ru-RU')} тг</strong>
+                        <span>{new Date(offer.parsed_at).toLocaleDateString('ru-RU')}</span>
+                      </div>
+                      <div className="clinic-meta">
+                        {offer.rating && <p>Рейтинг: {offer.rating.toFixed(1)} ★</p>}
+                        {offer.distance_km !== undefined && offer.distance_km < 1e6 && <p>{offer.distance_km.toFixed(1)} км от вас</p>}
+                        {offer.address && <p>{offer.address}</p>}
+                        {offer.working_hours && <p>{offer.working_hours}</p>}
+                      </div>
+                      <div className="card-actions-row">
+                        <label className="compare-check">
+                          <input type="checkbox" checked={isCompared} onChange={() => toggleCompare(offer)} />
+                          Сравнить
+                        </label>
+                        <button type="button" className="link-button" onClick={() => openHistory(offer)}>История</button>
+                      </div>
+                      <div className="clinic-actions">
+                        {siteUrl && <a href={siteUrl} target="_blank" rel="noreferrer">Сайт</a>}
+                        {offer.phone && <a href={`tel:${offer.phone}`}>{offer.phone}</a>}
+                        {offer.address && (
+                          <a href={`${mapsUrl}&destination=${encodeURIComponent(offer.address + ' ' + offer.city)}`} target="_blank" rel="noreferrer">Маршрут</a>
+                        )}
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+
+              {totalPages > 1 && (
+                <div className="pagination">
+                  <button type="button" disabled={page <= 1} onClick={() => setPage(p => p - 1)}>Назад</button>
+                  <span>Страница {page} из {totalPages}</span>
+                  <button type="button" disabled={page >= totalPages} onClick={() => setPage(p => p + 1)}>Вперёд</button>
+                </div>
+              )}
+            </section>
+          </>
         )}
       </main>
     </div>
   );
 }
-
-export default App;
