@@ -12,7 +12,7 @@ import {
     DATA_FRESHNESS_DAYS
 } from "./parser";
 
-import { serviceCatalog, serviceSynonyms, resolveCatalogQuery } from "./service-catalog";
+import { serviceCatalog, serviceSynonyms, resolveCatalogQuery, buildServiceSearchFilter } from "./service-catalog";
 import { OfferRecord } from "./db";
 import { SOURCES, sourceClinicFilter, sourcesClinicFilter } from "./sources";
 
@@ -156,7 +156,15 @@ function buildServiceFilters(req: Request) {
     }
     applyCityFilter(filters, cities);
     if (category)     filters.category = category;
-    if (serviceId)    filters.service_id = serviceId;
+    if (serviceId) {
+        const catalogEntry = serviceCatalog.find(s => s.service_id === serviceId);
+        if (catalogEntry) {
+            const searchFilter = buildServiceSearchFilter(catalogEntry.service_name_norm);
+            if (searchFilter) appendAndFilter(filters, searchFilter);
+        } else {
+            filters.service_id = serviceId;
+        }
+    }
     if (ratingMin !== null && ratingMin > 0) {
         filters.rating = { $gte: ratingMin };
     }
@@ -170,19 +178,8 @@ function buildServiceFilters(req: Request) {
             : null;
     if (srcFilter) appendAndFilter(filters, srcFilter);
     if (query) {
-        const catalogMatches = resolveCatalogQuery(query);
-        if (catalogMatches.length === 1) {
-            filters.service_id = catalogMatches[0].service_id;
-        } else if (catalogMatches.length > 1) {
-            filters.service_id = { $in: catalogMatches.map(s => s.service_id) };
-        } else {
-            appendAndFilter(filters, {
-                $or: [
-                    { service_name_norm: { $regex: query, $options: "i" } },
-                    { service_name_raw:  { $regex: query, $options: "i" } }
-                ]
-            });
-        }
+        const searchFilter = buildServiceSearchFilter(query);
+        if (searchFilter) appendAndFilter(filters, searchFilter);
     }
 
     return { filters, query, city, cities, category, priceMin, priceMax, ratingMin, onlineOnly, serviceId, source, sources };
@@ -340,13 +337,25 @@ router.get("/categories", async (req: Request, res: Response) => {
 
 router.get("/services", async (req: Request, res: Response) => {
     try {
-        const page      = parseIntSafe(req.query.page,  1,  1);
-        const limit     = parseIntSafe(req.query.limit, 50, 1, 200);
-        const sort      = String(req.query.sort ?? "price_asc");
-        const userLat   = parseFloatSafe(req.query.lat);
-        const userLng   = parseFloatSafe(req.query.lng);
+        const page = parseIntSafe(req.query.page, 1, 1);
+        const limit = parseIntSafe(req.query.limit, 50, 1, 200);
+
+        const sort = String(req.query.sort ?? "price_asc");
+
+        const userLat = parseFloatSafe(req.query.lat);
+        const userLng = parseFloatSafe(req.query.lng);
 
         const { filters, city, cities } = buildServiceFilters(req);
+
+        // NEW: search by clinic name
+        const clinic = String(req.query.clinic ?? "").trim();
+
+        if (clinic) {
+            filters.clinic_name = {
+                $regex: clinic,
+                $options: "i"
+            };
+        }
 
         if (!city && cities.length === 0) {
             return res.json({
@@ -358,36 +367,67 @@ router.get("/services", async (req: Request, res: Response) => {
             });
         }
 
-        const cacheKey = `${JSON.stringify(filters)}|${sort}|${userLat}|${userLng}|${page}|${limit}`;
+        const cacheKey =
+            `${JSON.stringify(filters)}|${sort}|${userLat}|${userLng}|${page}|${limit}`;
+
         const cached = getCachedServices(cacheKey);
-        if (cached) return res.json(cached);
+
+        if (cached)
+            return res.json(cached);
 
         const activeFilters = activeOfferFilter(filters);
 
-        if (sort === "distance" && userLat !== null && userLng !== null) {
+        if (
+            sort === "distance" &&
+            userLat !== null &&
+            userLng !== null
+        ) {
             const all = await OfferRecord.find(activeFilters).lean();
+
             const withDist = all
                 .map(o => ({
                     ...o,
                     distance_km: o.location
-                        ? haversineKm(userLat, userLng, o.location.lat, o.location.lng)
+                        ? haversineKm(
+                              userLat,
+                              userLng,
+                              o.location.lat,
+                              o.location.lng
+                          )
                         : Number.MAX_SAFE_INTEGER
                 }))
                 .sort((a, b) => a.distance_km - b.distance_km);
 
             const total = withDist.length;
-            const data = withDist.slice((page - 1) * limit, page * limit);
-            const result = { count: total, page, limit, data, price_stats: await computePriceStats(filters) };
+
+            const data = withDist.slice(
+                (page - 1) * limit,
+                page * limit
+            );
+
+            const result = {
+                count: total,
+                page,
+                limit,
+                data,
+                price_stats: await computePriceStats(filters)
+            };
+
             setCachedServices(cacheKey, result);
+
             return res.json(result);
         }
 
         const sortField: Record<string, 1 | -1> =
-            sort === "price_desc"  ? { price_kzt: -1 } :
-            sort === "date_desc"   ? { parsed_at: -1 } :
-            sort === "date_asc"    ? { parsed_at: 1 } :
-            sort === "rating_desc" ? { rating: -1 } :
-                                   { price_kzt: 1 };
+            sort === "price_desc"
+                ? { price_kzt: -1 }
+                : sort === "date_desc"
+                ? { parsed_at: -1 }
+                : sort === "date_asc"
+                ? { parsed_at: 1 }
+                : sort === "rating_desc"
+                ? { rating: -1 }
+                : { price_kzt: 1 };
 
         const [offers, total, priceStats] = await Promise.all([
             fetchNormalizedOffers(activeFilters, sortField, page, limit),
@@ -395,11 +435,21 @@ router.get("/services", async (req: Request, res: Response) => {
             computePriceStats(filters)
         ]);
 
-        const result = { count: total, page, limit, data: offers, price_stats: priceStats };
+        const result = {
+            count: total,
+            page,
+            limit,
+            data: offers,
+            price_stats: priceStats
+        };
+
         setCachedServices(cacheKey, result);
+
         res.json(result);
     } catch (err: any) {
-        res.status(500).json({ error: err?.message ?? "Server error" });
+        res.status(500).json({
+            error: err?.message ?? "Server error"
+        });
     }
 });
 
@@ -461,21 +511,16 @@ router.get("/clinics", async (req: Request, res: Response) => {
 
         if (!mapOnly) {
             if (serviceId) {
-                filters.service_id = serviceId;
-            } else if (query) {
-                const catalogMatches = resolveCatalogQuery(query);
-                if (catalogMatches.length === 1) {
-                    filters.service_id = catalogMatches[0].service_id;
-                } else if (catalogMatches.length > 1) {
-                    filters.service_id = { $in: catalogMatches.map(s => s.service_id) };
+                const catalogEntry = serviceCatalog.find(s => s.service_id === serviceId);
+                if (catalogEntry) {
+                    const searchFilter = buildServiceSearchFilter(catalogEntry.service_name_norm);
+                    if (searchFilter) appendAndFilter(filters, searchFilter);
                 } else {
-                    appendAndFilter(filters, {
-                        $or: [
-                            { service_name_norm: { $regex: query, $options: "i" } },
-                            { service_name_raw: { $regex: query, $options: "i" } }
-                        ]
-                    });
+                    filters.service_id = serviceId;
                 }
+            } else if (query) {
+                const searchFilter = buildServiceSearchFilter(query);
+                if (searchFilter) appendAndFilter(filters, searchFilter);
             }
         }
 

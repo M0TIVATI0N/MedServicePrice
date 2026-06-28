@@ -29,6 +29,23 @@ export function deviationLabel(pct: number): string {
   return `${pct.toFixed(0)}% выше медианы`;
 }
 
+export function build2gisRouteUrl(
+  address: string,
+  city: string,
+  dest?: { lat: number; lng: number },
+  from?: { lat: number; lng: number }
+): string {
+  const base = import.meta.env.VITE_2GIS_URL || 'https://2gis.kz';
+  if (from && dest) {
+    return `${base}/directions/points/${from.lng},${from.lat}|${dest.lng},${dest.lat}`;
+  }
+  if (dest) {
+    return `${base}/search/${dest.lng},${dest.lat}`;
+  }
+  const query = [address, city].filter(Boolean).join(', ');
+  return `${base}/search/${encodeURIComponent(query)}`;
+}
+
 export function sourceLabel(clinicId: string): string {
   if (clinicId.startsWith('kdl-')) return 'KDL';
   if (clinicId.startsWith('doq-')) return 'DOQ';

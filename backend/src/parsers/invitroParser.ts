@@ -153,7 +153,7 @@ export async function parseInvitroPrices(): Promise<RawClinicRecord[]> {
                 clinic_name: o.name,
                 address: o.address,
                 location: o.location ?? cityLocation(city.name, `invitro-${city.slug}-${o.id}`),
-                source_url: `${BASE}/offices/${city.slug}/`
+                source_url: `${BASE}/offices/${city.slug}/#office-${o.id}`,
             }))
             : [{
                 clinic_id: `invitro-${city.slug}`,

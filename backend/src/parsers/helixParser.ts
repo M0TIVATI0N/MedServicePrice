@@ -26,21 +26,28 @@ const HELIX_CITY_PAGES: Array<{ alias: string; name: string; cityId?: number }> 
     { alias: "pavlodar", name: "Павлодар", cityId: 0 }
 ];
 
-/** Replicate Helix prices to other KZ cities (same national price list) */
-const HELIX_REPLICATE_CITIES = [
-    "Шымкент",
-    "Караганда",
-    "Актобе",
-    "Усть-Каменогорск",
-    "Атырау",
-    "Костанай",
-    "Кызылорда",
-    "Петропавловск",
-    "Тараз",
-    "Актау",
-    "Уральск",
-    "Семей"
-];
+const HELIX_CITY_SLUGS: Record<string, string> = {
+    Алматы: "almaty",
+    Астана: "astana",
+    Павлодар: "pavlodar",
+    Шымкент: "almaty",
+    Караганда: "almaty",
+    Актобе: "almaty",
+    "Усть-Каменогорск": "almaty",
+    Атырау: "almaty",
+    Костанай: "almaty",
+    Кызылорда: "almaty",
+    Петропавловск: "almaty",
+    Тараз: "almaty",
+    Актау: "almaty",
+    Уральск: "almaty",
+    Семей: "almaty"
+};
+
+function helixCityUrl(cityName: string): string {
+    const slug = HELIX_CITY_SLUGS[cityName] ?? "almaty";
+    return `${HELIX_WEB}/${slug}`;
+}
 
 interface HelixProduct {
     hxid: string;
@@ -152,7 +159,7 @@ function productsToRecords(
         address: `Лаборатория Helix, ${cityName}`,
         phone: "",
         working_hours: "",
-        source_url: sourceUrl,
+        source_url: helixCityUrl(cityName),
         service_name_raw: p.title,
         category: "лаборатория",
         price_kzt: p.price,
@@ -209,20 +216,20 @@ export async function parseHelixPrices(): Promise<RawClinicRecord[]> {
                 baseProducts,
                 page.name,
                 page.alias,
-                `${HELIX_WEB}/${page.alias}`,
+                helixCityUrl(page.name),
                 parsedAt
             )
         );
     }
 
-    for (const cityName of HELIX_REPLICATE_CITIES) {
-        const slug = cityName.toLowerCase();
+    for (const cityName of Object.keys(HELIX_CITY_SLUGS)) {
+        if (HELIX_CITY_PAGES.some(p => p.name === cityName)) continue;
         out.push(
             ...productsToRecords(
                 baseProducts,
                 cityName,
-                slug,
-                `${HELIX_WEB}/almaty`,
+                HELIX_CITY_SLUGS[cityName],
+                helixCityUrl(cityName),
                 parsedAt
             )
         );

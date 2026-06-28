@@ -562,6 +562,49 @@ export function resolveCatalogQuery(q: string): NormalizedService[] {
   });
 }
 
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Match catalog IDs and raw provider names (KDL/Invitro often stay unmatched). */
+export function buildServiceSearchFilter(query: string): Record<string, unknown> | null {
+  const trimmed = query.trim();
+  if (!trimmed) return null;
+
+  const catalogMatches = resolveCatalogQuery(trimmed);
+  if (!catalogMatches.length) {
+    return {
+      $or: [
+        { service_name_norm: { $regex: trimmed, $options: "i" } },
+        { service_name_raw: { $regex: trimmed, $options: "i" } }
+      ]
+    };
+  }
+
+  const serviceIds = catalogMatches.map(s => s.service_id);
+  const idClause =
+    serviceIds.length === 1
+      ? { service_id: serviceIds[0] }
+      : { service_id: { $in: serviceIds } };
+
+  const rawPatterns = new Set<string>();
+  for (const s of catalogMatches) {
+    rawPatterns.add(s.service_name_norm);
+    for (const syn of serviceSynonyms[s.service_name_norm] ?? []) {
+      rawPatterns.add(syn);
+    }
+  }
+
+  const rawClauses = [...rawPatterns]
+    .filter(Boolean)
+    .slice(0, 32)
+    .map(p => ({
+      service_name_raw: { $regex: escapeRegex(p), $options: "i" }
+    }));
+
+  return { $or: [idClause, ...rawClauses] };
+}
+
 /* -------------------- OPTIONAL: EXPORT FLAT MAP FOR EVEN FASTER USAGE -------------------- */
 
 export const FAST_SERVICE_INDEX: Record<string, string> = Object.fromEntries(

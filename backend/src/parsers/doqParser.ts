@@ -164,11 +164,9 @@ function doctorsToRecords(
 
 
 
-            const doctorUrl = doctor.slug
-                ? `https://doq.kz/doctors/${doctor.slug}`
-                : branch.clinic_slug
-                    ? `https://doq.kz/clinics/${city.slug}/${branch.clinic_slug}`
-                    : `https://doq.kz/?city=${city.slug}`;
+            const clinicUrl = branch.clinic_slug
+                ? `https://doq.kz/clinics/${city.slug}/${branch.clinic_slug}`
+                : `https://doq.kz/?city=${city.slug}`;
 
             out.push({
 
@@ -184,7 +182,7 @@ function doctorsToRecords(
 
                 working_hours: "09:00-20:00",
 
-                source_url: doctorUrl,
+                source_url: clinicUrl,
 
                 service_name_raw: name,
 

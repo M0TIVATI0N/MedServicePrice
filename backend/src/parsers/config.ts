@@ -57,7 +57,7 @@ export const INVITRO_CATEGORY_IDS = (
 export const PARSER_MAX_RECORDS = envInt("PARSER_MAX_RECORDS", 250000);
 /** Cap each source separately so KDL doesn't crowd out DOQ / Invitro */
 export const PARSER_MAX_PER_SOURCE = envInt("PARSER_MAX_PER_SOURCE", 50000);
-export const PARSER_MAX_KDL = envInt("PARSER_MAX_KDL", 30000);
+export const PARSER_MAX_KDL = envInt("PARSER_MAX_KDL", 50000);
 export const PARSER_STORE_RAW = process.env.PARSER_STORE_RAW === "true";
 /** Only wipe DB when explicitly enabled — avoids empty DB after failed parse */
 export const PARSER_REPLACE_DB = process.env.PARSER_REPLACE_DB === "true";
